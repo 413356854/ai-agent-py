@@ -1,0 +1,35 @@
+# ---- python ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# ---- secrets --------------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# ---- data -----------------------------------------------------------------
+data/chroma/
+data/raw/*
+!data/raw/.gitkeep
+!data/raw/sample.md
+
+# ---- editors / os ---------------------------------------------------------
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# ---- logs -----------------------------------------------------------------
+*.log
