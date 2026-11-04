@@ -29,10 +29,19 @@ dependencies = [
     # --- document loaders ------------------------------------------------
     "pypdf>=4.2",
     "python-docx>=1.1",
+    "beautifulsoup4>=4.12",  # HTMLHeaderTextSplitter 解析 h1~h4
     # --- http api --------------------------------------------------------
     "fastapi>=0.111",
     "uvicorn>=0.30",
     "httpx>=0.27",
+    "python-multipart>=0.0.33",
+    # --- MySQL（文档解析任务记录 tb_document_parse_job）-------------------
+    "sqlalchemy>=2.0,<3",
+    "pymysql>=1.1,<2",
+    "cryptography>=42",
+    # --- Milvus（切分后写入 db_tax_rag.rag_chunk）-------------------------
+    "pymilvus>=2.5,<3",
+    "openpyxl>=3.1.5",
 ]
 
 [project.scripts]

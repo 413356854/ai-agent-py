@@ -29,7 +29,8 @@ def get_chat_model(
     if not api_key:
         raise ConfigurationError(
             "Missing chat model API key. Copy `.env.example` to `.env` and set LLM_API_KEY "
-            "(or OPENAI_API_KEY). Run `ai-agent-py demo` for a key-less offline check."
+            "(or export DASHSCOPE_API_KEY / OPENAI_API_KEY). "
+            "Run `ai-agent-py demo` for a key-less offline check."
         )
 
     kwargs: dict[str, Any] = {
@@ -55,15 +56,20 @@ def get_embeddings(settings: Settings | None = None) -> Embeddings:
     if not api_key:
         raise ConfigurationError(
             "Missing embedding API key. Copy `.env.example` to `.env` and set "
-            "EMBEDDING_API_KEY (or OPENAI_API_KEY)."
+            "EMBEDDING_API_KEY or DASHSCOPE_API_KEY (or OPENAI_API_KEY)."
         )
 
     kwargs: dict[str, Any] = {
         "model": cfg.embedding_model,
         "api_key": api_key,
+        # DashScope 兼容接口单次最多接收 10 条文本；与入库批大小保持一致。
+        "chunk_size": max(1, cfg.embedding_batch_size),
     }
     if cfg.embedding_base_url:
         kwargs["base_url"] = cfg.embedding_base_url
+    if cfg.embedding_dimensions is not None:
+        # text-embedding-v4 默认 1024 维；Milvus 集合按 1536 维建时必须显式指定。
+        kwargs["dimensions"] = cfg.embedding_dimensions
     # Non-OpenAI endpoints usually reject tiktoken based input chunking.
     check_ctx = cfg.embedding_check_ctx_length
     if check_ctx is None:

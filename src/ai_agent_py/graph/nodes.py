@@ -29,6 +29,7 @@ def build_agent_node(
     model = llm.bind_tools(list(tools)) if tools else llm
 
     def agent_node(state: AgentState) -> dict[str, list[AnyMessage]]:
+        """Node: call the model once with the system prompt and append its reply."""
         messages: list[AnyMessage] = list(state["messages"])
         if not messages or not isinstance(messages[0], SystemMessage):
             messages.insert(0, SystemMessage(content=system_prompt))
@@ -45,6 +46,7 @@ def build_tool_node(
     by_name = {tool.name: tool for tool in tools}
 
     def tool_node(state: AgentState) -> dict[str, list[AnyMessage]]:
+        """Node: run every tool call from the last AI message and append ToolMessages."""
         messages = state["messages"]
         last = messages[-1] if messages else None
         calls = list(getattr(last, "tool_calls", None) or [])

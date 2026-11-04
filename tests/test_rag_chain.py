@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 from langchain_core.documents import Document
 from langchain_core.messages import AIMessage
 
@@ -10,6 +11,7 @@ from ai_agent_py.rag.chain import (
     answer_question,
     build_rag_chain,
     format_documents,
+    normalize_citations,
 )
 from ai_agent_py.rag.ingest import ingest
 from ai_agent_py.rag.retriever import get_retriever
@@ -85,3 +87,72 @@ def test_format_documents_numbers_sources_and_pages() -> None:
     assert rendered.startswith("[1] 来源：a.md")
     assert "[2] 来源：b.pdf（第 3 页）" in rendered
     assert format_documents([]) == "（未检索到相关资料）"
+
+
+# ---- 越界引用校正（法条号被当成来源编号）----------------------------------
+def test_normalize_citations_maps_article_number_to_its_source() -> None:
+    documents = [
+        Document(
+            page_content="第四十二条 职工教育经费支出，不超过工资薪金总额2.5%的部分，准予扣除。"
+        ),
+        Document(
+            page_content=(
+                "第四十三条 企业发生的与生产经营活动有关的业务招待费支出，"
+                "按照发生额的60%扣除，但最高不得超过当年销售（营业）收入的5‰。"
+            )
+        ),
+    ]
+
+    text, fixed = normalize_citations("最高不得超过当年销售（营业）收入的 5‰[43]。", documents)
+
+    assert text == "最高不得超过当年销售（营业）收入的 5‰[2]。"
+    assert fixed == [43]
+
+
+def test_normalize_citations_keeps_valid_indexes() -> None:
+    documents = [Document(page_content="甲"), Document(page_content="乙")]
+
+    text, fixed = normalize_citations("依据[1]和[2]。", documents)
+
+    assert text == "依据[1]和[2]。"
+    assert fixed == []
+
+
+def test_normalize_citations_falls_back_when_article_is_ambiguous() -> None:
+    documents = [
+        Document(page_content="第四十三条 业务招待费……"),
+        Document(page_content="另见第四十三条的衔接规定。"),
+    ]
+
+    # 两条资料都提到这条法条，无法判定来源：补成汉字法条引用
+    text, _ = normalize_citations("最高不超过 5‰[43]。", documents)
+    assert text == "最高不超过 5‰（第四十三条）。"
+
+    # 句子本身已经写了法条号，删掉方括号即可，避免重复
+    text, _ = normalize_citations("第四十三条规定最高不超过 5‰[43]。", documents)
+    assert text == "第四十三条规定最高不超过 5‰。"
+
+
+def test_normalize_citations_ignores_year_like_numbers() -> None:
+    documents = [Document(page_content="甲")]
+
+    text, fixed = normalize_citations("2024 年[2024]发布。", documents)
+
+    assert text == "2024 年[2024]发布。"
+    assert fixed == []
+
+
+@pytest.mark.parametrize(
+    ("number", "expected"),
+    [
+        (5, "第五条"),
+        (10, "第十条"),
+        (21, "第二十一条"),
+        (105, "第一百零五条"),
+        (110, "第一百一十条"),
+    ],
+)
+def test_normalize_citations_uses_chinese_article_labels(number: int, expected: str) -> None:
+    text, _ = normalize_citations(f"见[{number}]。", [Document(page_content="无关正文")])
+
+    assert text == f"见（{expected}）。"

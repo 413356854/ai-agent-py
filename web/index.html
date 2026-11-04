@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="ai-agent-py 管理后台：文档解析 / RAG 记录 / RAG 问答" />
+    <title>RAG 管理 · ai-agent-py</title>
+    <script>
+      // 首屏前先决定主题，避免暗色模式下闪一下白屏；React 挂载后由 ThemeProvider 接管。
+      ;(function () {
+        try {
+          var saved = localStorage.getItem('ai-agent-py:theme')
+          var dark =
+            saved === 'dark' ||
+            (saved !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches)
+          document.documentElement.dataset.theme = dark ? 'dark' : 'light'
+          document.documentElement.style.colorScheme = dark ? 'dark' : 'light'
+        } catch (error) {
+          /* localStorage 不可用时保持默认亮色 */
+        }
+      })()
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

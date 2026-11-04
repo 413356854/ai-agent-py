@@ -42,6 +42,42 @@ def test_blank_values_become_none(monkeypatch: pytest.MonkeyPatch) -> None:
     assert cfg.llm_base_url is None
 
 
+def test_dashscope_key_is_used_for_embeddings(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "sk-dashscope-test")
+    monkeypatch.setenv("EMBEDDING_DIMENSIONS", "1536")
+    cfg = Settings(_env_file=None)
+
+    assert cfg.resolved_embedding_api_key == "sk-dashscope-test"
+    assert cfg.embedding_dimensions == 1536
+    assert "1536" in str(cfg.describe()["embedding_dimensions"])
+
+
+def test_embedding_key_takes_priority_over_dashscope(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "sk-dashscope-test")
+    ephemeral = Settings(_env_file=None, embedding_api_key="sk-explicit")
+    assert ephemeral.resolved_embedding_api_key == "sk-explicit"
+
+
+def test_dashscope_key_is_used_for_llm(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "sk-dashscope-test")
+    cfg = Settings(_env_file=None)
+
+    assert cfg.resolved_llm_api_key == "sk-dashscope-test"
+    assert cfg.describe()["llm_api_key"].startswith("set")
+
+
+def test_llm_key_takes_priority_over_dashscope(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "sk-dashscope-test")
+    cfg = Settings(_env_file=None, llm_api_key="sk-explicit")
+    assert cfg.resolved_llm_api_key == "sk-explicit"
+
+
+def test_openai_key_is_last_resort_for_llm(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-test")
+    cfg = Settings(_env_file=None)
+    assert cfg.resolved_llm_api_key == "sk-openai-test"
+
+
 def test_relative_paths_resolve_against_project_root() -> None:
     cfg = Settings(_env_file=None, chroma_dir="build/chroma")  # type: ignore[arg-type]
     assert cfg.chroma_dir.is_absolute()

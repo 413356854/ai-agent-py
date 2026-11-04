@@ -1,0 +1,31 @@
+version: 1
+status: placeholder
+note: 占位参数（未经财务确认）。生产环境须替换为正式制度，并保留版本与生效期。
+params:
+  lodging_cap_per_night:
+    一线: 700
+    二线: 450
+    三线: 350
+  entertainment_per_head: 300
+  invoice_amount_requires_contract: 5000
+  allowed_kinds:
+    差旅:
+    - 专票
+    - 普票
+    - 电子普票
+    - 行程单
+    招待:
+    - 专票
+    - 普票
+    - 电子普票
+    办公:
+    - 专票
+    - 普票
+    - 电子普票
+    交通:
+    - 专票
+    - 普票
+    - 电子普票
+    - 行程单
+    - 出租车票
+updated_at: '2026-11-04T10:14:10'

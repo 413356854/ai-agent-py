@@ -1,0 +1,123 @@
+version: 1
+updated_at: "2026-11-04"
+note: 首版 12 条规则；check 字段对应 rules.py 里的判定器注册名。
+rules:
+  - id: R1.1
+    name: 发票重复报销
+    category: 票据合规
+    severity: 阻断
+    stage: hard
+    check: duplicate_invoice
+    message: "发票号 {number} 已在历史报销记录中出现"
+    citation: 内部报销制度 · 票据要求
+
+  - id: R1.3
+    name: 购买方抬头不符
+    category: 票据合规
+    severity: 阻断
+    stage: hard
+    check: buyer_mismatch
+    message: "发票购买方与本企业主体不一致"
+    citation: 发票管理办法 · 开具要求
+
+  - id: R1.4
+    name: 开票日期超出报销期间
+    category: 票据合规
+    severity: 阻断
+    stage: hard
+    check: date_out_of_period
+    message: "发票日期 {date} 不在报销期间 {period} 内"
+    citation: 内部报销制度 · 报销时限
+
+  - id: R1.5
+    name: 票种与费用类型不符
+    category: 票据合规
+    severity: 阻断
+    stage: hard
+    check: kind_mismatch
+    message: "「{category}」不接受「{kind}」作为报销凭证"
+    citation: 内部报销制度 · 凭证类型
+
+  - id: R2.1
+    name: 明细合计与报销金额不符
+    category: 金额勾稽
+    severity: 阻断
+    stage: hard
+    check: amount_sum_mismatch
+    message: "发票合计 {sum} 与报销金额 {total} 相差 {diff}"
+    citation: 会计基础工作规范 · 原始凭证
+
+  - id: R2.2
+    name: 价税合计不等于金额加税额
+    category: 金额勾稽
+    severity: 阻断
+    stage: hard
+    check: tax_math_mismatch
+    message: "发票 {number} 金额 {amount} + 税额 {tax} ≠ 价税合计 {total}"
+    citation: 发票管理办法 · 票面要素
+
+  - id: R2.4
+    name: 大额发票缺少合同
+    category: 金额勾稽
+    severity: 警告
+    stage: policy
+    check: invoice_over_limit_without_contract
+    params: [invoice_amount_requires_contract]
+    message: "发票 {number} 金额 {total} 元达到 {threshold} 元，未附合同/订单"
+    citation: 采购管理制度（占位参数）
+
+  - id: R3.1
+    name: 住宿费超标
+    category: 标准合规
+    severity: 警告
+    stage: policy
+    check: lodging_over_cap
+    params: [lodging_cap_per_night]
+    message: "住宿 {nightly} 元/晚，超过{ tier }标准 {cap} 元/晚"
+    citation: 差旅费管理办法（占位参数）
+
+  - id: R3.2
+    name: 招待费人均超标
+    category: 标准合规
+    severity: 警告
+    stage: policy
+    check: entertainment_over_cap
+    params: [entertainment_per_head]
+    message: "招待人均 {per_head} 元，超过标准 {cap} 元"
+    citation: 业务招待费管理办法（占位参数）
+
+  - id: R5.3
+    name: 缺少合规税前扣除凭证
+    category: 税务合规
+    severity: 阻断
+    stage: policy
+    check: receipt_kind
+    message: "「{kind}」不属于合规税前扣除凭证，需换开正式发票"
+    citation: 国家税务总局公告 2018 年第 28 号
+
+  - id: R6.2
+    name: 报销人与审批人相同
+    category: 审批合规
+    severity: 阻断
+    stage: hard
+    check: self_approval
+    message: "报销人同时是审批人，审批链无效"
+    citation: 内部控制规范 · 不相容岗位分离
+
+  - id: R4.2
+    name: 事由与票据内容不相关
+    category: 业务合理性
+    severity: 中
+    stage: semantic
+    check: purpose_mismatch
+    message: "报销事由与发票项目缺少语义关联，需人工确认业务实质"
+    citation: 人工智能辅助判断 · 不构成退回依据
+
+  - id: R4.4
+    name: 连号发票
+    category: 业务合理性
+    severity: 中
+    stage: semantic
+    check: consecutive_invoice
+    message: "存在连号发票 {numbers}，疑似集中开票或拆分"
+    citation: 人工智能辅助判断 · 不构成退回依据

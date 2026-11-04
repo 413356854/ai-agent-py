@@ -1,0 +1,335 @@
+import type {
+  AgentConfig,
+  AgentDetail,
+  AgentGraph,
+  AgentRunResult,
+  AgentSample,
+  AgentSummary,
+  AgentUploadResult,
+  DocumentConfig,
+  IngestResult,
+  MarkdownOut,
+  ParseJob,
+  RagChatResponse,
+  RagChatStreamHandlers,
+  RagChunkList,
+  RagChunkParams,
+  RagIngestParams,
+  RagIngestResult,
+  RagOverview,
+  RagSource,
+  SplitParams,
+  SplitPreview,
+  UploadOptions,
+} from '../types'
+
+/** 由 FastAPI 直接托管时为相对路径，开发时可被 Vite 代理。 */
+export const API_BASE = (import.meta.env.VITE_API_BASE ?? '').replace(/\/$/, '')
+
+export class ApiError extends Error {
+  readonly status: number
+
+  constructor(status: number, message: string) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+  }
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  let response: Response
+  try {
+    response = await fetch(`${API_BASE}${path}`, init)
+  } catch (error) {
+    throw new ApiError(0, `无法连接后端服务：${String(error)}`)
+  }
+  if (!response.ok) {
+    let detail = `请求失败（HTTP ${response.status}）`
+    try {
+      const body: unknown = await response.json()
+      if (body && typeof body === 'object' && 'detail' in body) {
+        const raw = (body as { detail: unknown }).detail
+        detail = typeof raw === 'string' ? raw : JSON.stringify(raw)
+      }
+    } catch {
+      // 响应不是 JSON，保留默认提示
+    }
+    throw new ApiError(response.status, detail)
+  }
+  if (response.status === 204) {
+    return undefined as T
+  }
+  return (await response.json()) as T
+}
+
+export const api = {
+  config: () => request<DocumentConfig>('/api/documents/config'),
+
+  list: () => request<ParseJob[]>('/api/documents'),
+
+  get: (jobId: string) => request<ParseJob>(`/api/documents/${jobId}`),
+
+  parse: (file: File, options: UploadOptions) => {
+    const form = new FormData()
+    form.append('file', file)
+    form.append('model_version', options.model_version)
+    form.append('language', options.language)
+    form.append('enable_formula', String(options.enable_formula))
+    form.append('enable_table', String(options.enable_table))
+    form.append('is_ocr', String(options.is_ocr))
+    if (options.page_ranges?.trim()) {
+      form.append('page_ranges', options.page_ranges.trim())
+    }
+    return request<ParseJob>('/api/documents/parse', { method: 'POST', body: form })
+  },
+
+  markdown: (jobId: string) => request<MarkdownOut>(`/api/documents/${jobId}/markdown`),
+
+  /** 按文档后缀选择切分器，返回预览片段。 */
+  split: (jobId: string, params: SplitParams = {}) => {
+    const query = new URLSearchParams()
+    if (params.chunk_size !== undefined) query.set('chunk_size', String(params.chunk_size))
+    if (params.chunk_overlap !== undefined) {
+      query.set('chunk_overlap', String(params.chunk_overlap))
+    }
+    if (params.limit !== undefined) query.set('limit', String(params.limit))
+    const suffix = query.size ? `?${query.toString()}` : ''
+    return request<SplitPreview>(`/api/documents/${jobId}/chunks${suffix}`)
+  },
+
+  /**
+   * 把用户查阅过的切分结果写回 Milvus `rag_chunk`（按 doc_id 覆盖旧块）。
+   * 优先传 split_id：后端从缓存读取完整切片，请求体只有几十字节。
+   */
+  ingestRag: (jobId: string, params: RagIngestParams = {}) =>
+    request<RagIngestResult>(`/api/documents/${jobId}/rag`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...(params.split_id !== undefined ? { split_id: params.split_id } : {}),
+        ...(params.chunks !== undefined ? { chunks: params.chunks } : {}),
+        ...(params.total !== undefined ? { total: params.total } : {}),
+        ...(params.chunk_size !== undefined ? { chunk_size: params.chunk_size } : {}),
+        ...(params.chunk_overlap !== undefined
+          ? { chunk_overlap: params.chunk_overlap }
+          : {}),
+      }),
+    }),
+
+  ingest: (jobId: string) =>
+    request<IngestResult>(`/api/documents/${jobId}/ingest`, { method: 'POST' }),
+
+  remove: (jobId: string) => request<void>(`/api/documents/${jobId}`, { method: 'DELETE' }),
+
+  downloadUrl: (jobId: string, kind: 'markdown' | 'zip' | 'source') =>
+    `${API_BASE}/api/documents/${jobId}/download?kind=${kind}`,
+
+  /* ---- RAG 记录 / RAG 问答 -------------------------------------------- */
+  ragOverview: () => request<RagOverview>('/api/rag/overview'),
+
+  ragChunks: (params: RagChunkParams = {}) => {
+    const query = new URLSearchParams()
+    if (params.doc_id) query.set('doc_id', params.doc_id)
+    if (params.keyword) query.set('keyword', params.keyword)
+    if (params.page !== undefined) query.set('page', String(params.page))
+    if (params.page_size !== undefined) query.set('page_size', String(params.page_size))
+    const suffix = query.size ? `?${query.toString()}` : ''
+    return request<RagChunkList>(`/api/rag/chunks${suffix}`)
+  },
+
+  /** 非流式问答；聊天界面用 `ragChatStream` 逐 token 显示。 */
+  ragChat: (message: string, threadId: string) =>
+    request<RagChatResponse>('/api/rag/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message, thread_id: threadId }),
+    }),
+
+  /** 流式问答：`stage` → `sources` → 若干 `token` → `done`（异常走 `error`）。 */
+  ragChatStream: (
+    message: string,
+    threadId: string,
+    handlers: RagChatStreamHandlers,
+    signal?: AbortSignal,
+  ) => streamRagChat(message, threadId, handlers, signal),
+
+  /* ---- Agent 应用（报销审核等）--------------------------------------- */
+  agents: () => request<AgentSummary[]>('/api/agents'),
+
+  agent: (agentId: string) => request<AgentDetail>(`/api/agents/${agentId}`),
+
+  agentGraph: (agentId: string) => request<AgentGraph>(`/api/agents/${agentId}/graph`),
+
+  agentSamples: (agentId: string) => request<AgentSample[]>(`/api/agents/${agentId}/samples`),
+
+  agentConfig: (agentId: string) => request<AgentConfig>(`/api/agents/${agentId}/config`),
+
+  /** 整体覆盖写入参数并刷新缓存（落盘成功后返回最新配置）。 */
+  updateAgentParams: (agentId: string, params: Record<string, unknown>) =>
+    request<AgentConfig>(`/api/agents/${agentId}/config/params`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ params }),
+    }),
+
+  /** 手工改了 YAML 后，让进程重新读文件。 */
+  reloadAgentConfig: (agentId: string) =>
+    request<AgentConfig>(`/api/agents/${agentId}/config/reload`, { method: 'POST' }),
+
+  runAgent: (agentId: string, sampleId: string) =>
+    request<AgentRunResult>(`/api/agents/${agentId}/run`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sample_id: sampleId }),
+    }),
+
+  /** 用上传解析出来的单据试跑。 */
+  runAgentClaim: (agentId: string, claim: Record<string, unknown>) =>
+    request<AgentRunResult>(`/api/agents/${agentId}/run`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ claim }),
+    }),
+
+  /** 上传单据（.xlsx / .json），返回解析后的 claim 与告警。 */
+  parseUpload: (agentId: string, file: File) => {
+    const form = new FormData()
+    form.append('file', file)
+    return request<AgentUploadResult>(`/api/agents/${agentId}/upload`, {
+      method: 'POST',
+      body: form,
+    })
+  },
+
+  /** 空白模板 xlsx 下载地址。 */
+  agentTemplateUrl: (agentId: string) => `${API_BASE}/api/agents/${agentId}/template`,
+
+  /** 样例单据下载地址（填充好的样板）。 */
+  agentSampleDownloadUrl: (agentId: string, sampleId: string, fmt: 'xlsx' | 'json' = 'xlsx') =>
+    `${API_BASE}/api/agents/${agentId}/samples/${sampleId}/download?fmt=${fmt}`,
+}
+
+/** Markdown 里的相对图片路径（images/xxx.jpg）→ 解析结果静态目录。 */
+export function resolveAsset(base: string, source: string): string {
+  if (/^(https?:)?\/\//i.test(source) || source.startsWith('/') || source.startsWith('data:')) {
+    return source
+  }
+  return `${API_BASE}${base.replace(/\/$/, '')}/${source.replace(/^\.\//, '')}`
+}
+
+/* ---- SSE：RAG 问答流式输出 -----------------------------------------------
+ * 后端用 `text/event-stream` 推送四类事件（event: 名称 + data: JSON）：
+ *   stage   {stage, message}                 检索阶段提示
+ *   sources {query, sources[]}               引用片段（在 token 之前）
+ *   token   {text}                           增量答案
+ *   done    {answer, query, sources[]}       完整答案（以它为准）
+ *   error   {message}                        失败原因
+ * 这里手写一个极简 SSE 解析器：fetch + ReadableStream，支持 AbortSignal。
+ */
+interface SseEvent {
+  event: string
+  data: string
+}
+
+function parseSseBlock(raw: string): SseEvent | null {
+  let event = 'message'
+  const data: string[] = []
+  for (const line of raw.split(/\r?\n/)) {
+    if (line.startsWith('event:')) event = line.slice('event:'.length).trim()
+    else if (line.startsWith('data:')) data.push(line.slice('data:'.length).trimStart())
+  }
+  if (!data.length) return null
+  return { event, data: data.join('\n') }
+}
+
+async function* readSseEvents(response: Response): AsyncGenerator<SseEvent> {
+  const reader = response.body?.getReader()
+  if (!reader) throw new ApiError(0, '当前浏览器不支持流式响应')
+  const decoder = new TextDecoder('utf-8')
+  let buffer = ''
+
+  const drain = (): SseEvent[] => {
+    const events: SseEvent[] = []
+    let match = /\r?\n\r?\n/.exec(buffer)
+    while (match) {
+      const parsed = parseSseBlock(buffer.slice(0, match.index))
+      buffer = buffer.slice(match.index + match[0].length)
+      if (parsed) events.push(parsed)
+      match = /\r?\n\r?\n/.exec(buffer)
+    }
+    return events
+  }
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    for (const event of drain()) yield event
+  }
+  buffer += decoder.decode()
+  for (const event of drain()) yield event
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === 'AbortError'
+}
+
+async function streamRagChat(
+  message: string,
+  threadId: string,
+  handlers: RagChatStreamHandlers,
+  signal?: AbortSignal,
+): Promise<void> {
+  let response: Response
+  try {
+    response = await fetch(`${API_BASE}/api/rag/chat/stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+      body: JSON.stringify({ message, thread_id: threadId }),
+      signal,
+    })
+  } catch (error) {
+    if (isAbortError(error)) return
+    throw new ApiError(0, `无法连接后端服务：${String(error)}`)
+  }
+
+  if (!response.ok) {
+    let detail = `请求失败（HTTP ${response.status}）`
+    try {
+      const body: unknown = await response.json()
+      if (body && typeof body === 'object' && 'detail' in body) {
+        const raw = (body as { detail: unknown }).detail
+        detail = typeof raw === 'string' ? raw : JSON.stringify(raw)
+      }
+    } catch {
+      // 响应不是 JSON：保留默认提示
+    }
+    throw new ApiError(response.status, detail)
+  }
+
+  for await (const { event, data } of readSseEvents(response)) {
+    let payload: Record<string, unknown>
+    try {
+      payload = JSON.parse(data) as Record<string, unknown>
+    } catch {
+      continue
+    }
+    const sources = (payload.sources as RagSource[] | undefined) ?? []
+    if (event === 'stage') {
+      handlers.onStage?.(String(payload.stage ?? ''), String(payload.message ?? ''))
+    } else if (event === 'sources') {
+      handlers.onSources?.({ query: String(payload.query ?? ''), sources })
+    } else if (event === 'token') {
+      handlers.onToken?.(String(payload.text ?? ''))
+    } else if (event === 'done') {
+      handlers.onDone?.({
+        answer: String(payload.answer ?? ''),
+        query: String(payload.query ?? ''),
+        sources,
+      })
+    } else if (event === 'error') {
+      handlers.onError?.(String(payload.message ?? '问答失败'))
+      return
+    }
+  }
+}
