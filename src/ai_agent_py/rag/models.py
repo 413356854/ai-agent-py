@@ -176,7 +176,7 @@ class RagSourceOut(BaseModel):
     index: int
     chunk_id: str
     doc_id: str
-    source: str = Field(description="文件名（MySQL 可读时）或 doc_id")
+    source: str = Field(description="文件名（检索后按 doc_id 回查 MySQL）；查不到时退回 doc_id")
     page: int | None = None
     chunk_index: int = 0
     score: float | None = Field(default=None, description="精排分（0~1）；未精排时是 RRF 融合分")

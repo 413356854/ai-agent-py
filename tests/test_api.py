@@ -7,7 +7,6 @@ from langchain_core.messages import AIMessage
 
 import ai_agent_py.api.app as api_app
 from ai_agent_py.rag.ingest import ingest
-from ai_agent_py.rag.retriever import get_retriever
 from fakes import ScriptedChatModel
 
 
@@ -21,16 +20,16 @@ def test_health_reports_configuration(monkeypatch, settings) -> None:
     client = TestClient(api_app.app)
     body = client.get("/health").json()
     assert body["status"] == "ok"
-    assert body["vector_store"] == settings.vector_store
+    assert body["vector_store"] == "milvus"
+    assert body["collection"] == settings.milvus_collection
 
 
 def test_query_returns_answer_and_sources(
-    monkeypatch, settings, store, embeddings, corpus_dir
+    monkeypatch, settings, searcher, corpus_dir
 ) -> None:
-    ingest([corpus_dir], store=store, embeddings=embeddings, settings=settings, recreate=True)
-    retriever = get_retriever(store=store, settings=settings)
+    ingest([corpus_dir], writer=searcher, settings=settings)
     llm = ScriptedChatModel(responses=[AIMessage(content="答案来自知识库")])
-    client = _client(monkeypatch, (settings, llm, store, retriever))
+    client = _client(monkeypatch, (settings, llm, searcher))
 
     response = client.post("/query", json={"question": "用什么管理依赖？", "k": 2})
 
@@ -41,8 +40,8 @@ def test_query_returns_answer_and_sources(
     assert {"index", "source", "page", "snippet"} <= set(body["sources"][0])
 
 
-def test_query_validates_empty_question(monkeypatch, settings, store) -> None:
+def test_query_validates_empty_question(monkeypatch, settings, searcher) -> None:
     client = _client(
-        monkeypatch, (settings, ScriptedChatModel(responses=[AIMessage(content="x")]), store, None)
+        monkeypatch, (settings, ScriptedChatModel(responses=[AIMessage(content="x")]), searcher)
     )
     assert client.post("/query", json={"question": ""}).status_code == 422

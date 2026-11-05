@@ -1,5 +1,13 @@
 import type {
+  AgentChatMessage,
+  AgentChatMessageList,
+  AgentChatResponse,
+  AgentChatSession,
+  AgentChatStreamHandlers,
+  AgentChatSummary,
+  AgentCompactResult,
   AgentConfig,
+  AgentContextStats,
   AgentDetail,
   AgentGraph,
   AgentRunResult,
@@ -7,7 +15,7 @@ import type {
   AgentSummary,
   AgentUploadResult,
   DocumentConfig,
-  IngestResult,
+  GeneralAgentOverview,
   MarkdownOut,
   ParseJob,
   RagChatResponse,
@@ -116,9 +124,6 @@ export const api = {
       }),
     }),
 
-  ingest: (jobId: string) =>
-    request<IngestResult>(`/api/documents/${jobId}/ingest`, { method: 'POST' }),
-
   remove: (jobId: string) => request<void>(`/api/documents/${jobId}`, { method: 'DELETE' }),
 
   downloadUrl: (jobId: string, kind: 'markdown' | 'zip' | 'source') =>
@@ -207,6 +212,48 @@ export const api = {
   /** 样例单据下载地址（填充好的样板）。 */
   agentSampleDownloadUrl: (agentId: string, sampleId: string, fmt: 'xlsx' | 'json' = 'xlsx') =>
     `${API_BASE}/api/agents/${agentId}/samples/${sampleId}/download?fmt=${fmt}`,
+
+  /* ---- 通用 Agent（全部工具 + MySQL 会话记忆）------------------------- */
+  generalAgentOverview: () => request<GeneralAgentOverview>('/api/general-agent/overview'),
+
+  generalSessions: (limit = 50) =>
+    request<AgentChatSession[]>(`/api/general-agent/sessions?limit=${limit}`),
+
+  generalSessionMessages: (threadId: string, limit = 500) =>
+    request<AgentChatMessageList>(
+      `/api/general-agent/sessions/${encodeURIComponent(threadId)}/messages?limit=${limit}`,
+    ),
+
+  deleteGeneralSession: (threadId: string) =>
+    request<void>(`/api/general-agent/sessions/${encodeURIComponent(threadId)}`, {
+      method: 'DELETE',
+    }),
+
+  /** 手动压缩更早历史（不删除原始消息，只更新摘要）。 */
+  compactGeneralSession: (threadId: string, keep?: number) =>
+    request<AgentCompactResult>(
+      `/api/general-agent/sessions/${encodeURIComponent(threadId)}/compact`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(keep === undefined ? {} : { keep }),
+      },
+    ),
+
+  /** 非流式对话；页面用 `generalChatStream` 逐 token 显示并实时展示工具调用。 */
+  generalChat: (message: string, threadId: string) =>
+    request<AgentChatResponse>('/api/general-agent/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message, thread_id: threadId }),
+    }),
+
+  generalChatStream: (
+    message: string,
+    threadId: string,
+    handlers: AgentChatStreamHandlers,
+    signal?: AbortSignal,
+  ) => streamGeneralChat(message, threadId, handlers, signal),
 }
 
 /** Markdown 里的相对图片路径（images/xxx.jpg）→ 解析结果静态目录。 */
@@ -274,31 +321,31 @@ function isAbortError(error: unknown): boolean {
   return error instanceof Error && error.name === 'AbortError'
 }
 
-async function streamRagChat(
-  message: string,
-  threadId: string,
-  handlers: RagChatStreamHandlers,
+/** 打开一个 POST + SSE 的流，返回事件迭代器；HTTP 错误按 `ApiError` 抛出。 */
+async function openEventStream(
+  path: string,
+  body: unknown,
   signal?: AbortSignal,
-): Promise<void> {
+): Promise<AsyncGenerator<SseEvent>> {
   let response: Response
   try {
-    response = await fetch(`${API_BASE}/api/rag/chat/stream`, {
+    response = await fetch(`${API_BASE}${path}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
-      body: JSON.stringify({ message, thread_id: threadId }),
+      body: JSON.stringify(body),
       signal,
     })
   } catch (error) {
-    if (isAbortError(error)) return
+    if (isAbortError(error)) throw error
     throw new ApiError(0, `无法连接后端服务：${String(error)}`)
   }
 
   if (!response.ok) {
     let detail = `请求失败（HTTP ${response.status}）`
     try {
-      const body: unknown = await response.json()
-      if (body && typeof body === 'object' && 'detail' in body) {
-        const raw = (body as { detail: unknown }).detail
+      const payload: unknown = await response.json()
+      if (payload && typeof payload === 'object' && 'detail' in payload) {
+        const raw = (payload as { detail: unknown }).detail
         detail = typeof raw === 'string' ? raw : JSON.stringify(raw)
       }
     } catch {
@@ -307,7 +354,22 @@ async function streamRagChat(
     throw new ApiError(response.status, detail)
   }
 
-  for await (const { event, data } of readSseEvents(response)) {
+  return readSseEvents(response)
+}
+
+async function streamRagChat(
+  message: string,
+  threadId: string,
+  handlers: RagChatStreamHandlers,
+  signal?: AbortSignal,
+): Promise<void> {
+  const events = await openEventStream(
+    '/api/rag/chat/stream',
+    { message, thread_id: threadId },
+    signal,
+  )
+
+  for await (const { event, data } of events) {
     let payload: Record<string, unknown>
     try {
       payload = JSON.parse(data) as Record<string, unknown>
@@ -329,6 +391,77 @@ async function streamRagChat(
       })
     } else if (event === 'error') {
       handlers.onError?.(String(payload.message ?? '问答失败'))
+      return
+    }
+  }
+}
+
+function asSession(value: unknown): AgentChatSession {
+  const raw = (value ?? {}) as Record<string, unknown>
+  return {
+    thread_id: String(raw.thread_id ?? ''),
+    title: String(raw.title ?? ''),
+    message_count: Number(raw.message_count ?? 0),
+    created_at: String(raw.created_at ?? ''),
+    updated_at: String(raw.updated_at ?? ''),
+  }
+}
+
+async function streamGeneralChat(
+  message: string,
+  threadId: string,
+  handlers: AgentChatStreamHandlers,
+  signal?: AbortSignal,
+): Promise<void> {
+  const events = await openEventStream(
+    '/api/general-agent/chat/stream',
+    { message, thread_id: threadId },
+    signal,
+  )
+
+  for await (const { event, data } of events) {
+    let payload: Record<string, unknown>
+    try {
+      payload = JSON.parse(data) as Record<string, unknown>
+    } catch {
+      continue
+    }
+    if (event === 'stage') {
+      handlers.onStage?.(String(payload.stage ?? ''), String(payload.message ?? ''))
+    } else if (event === 'session') {
+      handlers.onSession?.(asSession(payload))
+    } else if (event === 'tool_call') {
+      handlers.onToolCall?.({
+        id: String(payload.id ?? ''),
+        name: String(payload.name ?? ''),
+        args: payload.args == null ? null : String(payload.args),
+        index: Number(payload.index ?? 0),
+      })
+    } else if (event === 'tool_result') {
+      handlers.onToolResult?.({
+        id: String(payload.id ?? ''),
+        name: String(payload.name ?? ''),
+        status: String(payload.status ?? 'ok'),
+        elapsed_ms: payload.elapsed_ms == null ? null : Number(payload.elapsed_ms),
+        content: String(payload.content ?? ''),
+      })
+    } else if (event === 'token') {
+      handlers.onToken?.(String(payload.text ?? ''))
+    } else if (event === 'done') {
+      handlers.onDone?.({
+        answer: String(payload.answer ?? ''),
+        thread_id: String(payload.thread_id ?? ''),
+        session: asSession(payload.session),
+        tool_calls: Number(payload.tool_calls ?? 0),
+        elapsed_ms: Number(payload.elapsed_ms ?? 0),
+        context: (payload.context ?? {}) as AgentContextStats,
+        summary: (payload.summary ?? null) as AgentChatSummary | null,
+        messages: Array.isArray(payload.messages)
+          ? (payload.messages as AgentChatMessage[])
+          : [],
+      })
+    } else if (event === 'error') {
+      handlers.onError?.(String(payload.message ?? '通用 Agent 执行失败'))
       return
     }
   }

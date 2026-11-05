@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING, Any, cast
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AnyMessage, HumanMessage
-from langchain_core.retrievers import BaseRetriever
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool
 from langgraph.graph import END, START, StateGraph
@@ -22,8 +21,8 @@ from ai_agent_py.config import Settings, get_settings
 from ai_agent_py.graph.nodes import build_agent_node, build_tool_node, route_after_agent
 from ai_agent_py.graph.state import AgentState
 from ai_agent_py.llm import get_chat_model
-from ai_agent_py.rag.retriever import get_retriever
-from ai_agent_py.tools import build_retriever_tool
+from ai_agent_py.rag.milvus_search import DocumentSearcher, get_milvus_searcher
+from ai_agent_py.tools import build_knowledge_tool
 
 if TYPE_CHECKING:
     from langgraph.graph.state import CompiledStateGraph
@@ -60,7 +59,7 @@ def _add_node(builder: StateGraph, name: str, node: Callable[[AgentState], Any])
 def build_agent_graph(
     *,
     llm: BaseChatModel | None = None,
-    retriever: BaseRetriever | None = None,
+    searcher: DocumentSearcher | None = None,
     tools: Sequence[BaseTool] | None = None,
     checkpointer: Any | None = None,
     settings: Settings | None = None,
@@ -68,7 +67,7 @@ def build_agent_graph(
 ) -> CompiledStateGraph:
     """Wire and compile the agent graph.
 
-    `llm` / `retriever` / `tools` are injectable so tests can run offline with
+    `llm` / `searcher` / `tools` are injectable so tests can run offline with
     fake models, and so extra tools can be added without touching this file.
     """
     cfg = settings or get_settings()
@@ -76,7 +75,7 @@ def build_agent_graph(
     tool_list: list[BaseTool] = (
         list(tools)
         if tools is not None
-        else [build_retriever_tool(retriever or get_retriever(settings=cfg))]
+        else [build_knowledge_tool(searcher or get_milvus_searcher(settings=cfg))]
     )
 
     builder = StateGraph(AgentState)

@@ -11,6 +11,14 @@ class ConfigurationError(AiAgentError):
     """Missing or invalid configuration (usually a missing API key)."""
 
 
+class ToolError(AiAgentError):
+    """A tool call was rejected or failed in an expected way.
+
+    Tool wrappers turn it into a ``错误：...`` string for the model, so a wrong
+    path, a bad regex or a missing file never breaks the agent loop.
+    """
+
+
 class DocumentLoadError(AiAgentError):
     """A file could not be loaded or its type is not supported."""
 

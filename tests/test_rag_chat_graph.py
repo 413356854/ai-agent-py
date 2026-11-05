@@ -16,7 +16,9 @@ from ai_agent_py.graph.rag_chat import (
     build_rag_chat_graph,
     rag_chat_config,
 )
-from fakes import ScriptedChatModel, StreamingScriptedChatModel
+from fakes import FakeDocumentNameResolver, ScriptedChatModel, StreamingScriptedChatModel
+
+_FILE_NAME = "中华人民共和国企业所得税法实施条例.docx"
 
 
 class FakeSearcher:
@@ -41,11 +43,21 @@ class FakeSearcher:
         ]
 
 
-def make_graph(model: Any, *, count: int = 2, checkpointer: Any = None) -> tuple[Any, FakeSearcher]:
+def make_graph(
+    model: Any,
+    *,
+    count: int = 2,
+    checkpointer: Any = None,
+    resolver: Any | None = None,
+) -> tuple[Any, FakeSearcher]:
     searcher = FakeSearcher(count=count)
+    name_resolver = (
+        resolver if resolver is not None else FakeDocumentNameResolver({"doc-a": _FILE_NAME})
+    )
     graph = build_rag_chat_graph(
         llm=model,
         searcher=searcher,
+        resolver=name_resolver,
         settings=Settings(_env_file=None),
         checkpointer=checkpointer,
     )
@@ -95,6 +107,70 @@ def test_prompt_bounds_citation_numbers_and_bans_article_numbers() -> None:
     assert "编号 1~3" in human
 
 
+def test_retrieved_chunks_get_mysql_file_names() -> None:
+    """Milvus 只给 doc_id；resolve 节点回查 MySQL 后，模型看到的是文件名。"""
+    model = ScriptedChatModel(responses=[AIMessage(content="答案一 [1]")])
+    resolver = FakeDocumentNameResolver({"doc-a": "企业所得税法实施条例.docx"})
+    graph, _ = make_graph(model, resolver=resolver)
+
+    turn = ask_rag_chat(graph, "业务招待费的扣除标准是什么？")
+
+    assert [document.metadata["source"] for document in turn.documents] == [
+        "企业所得税法实施条例.docx",
+        "企业所得税法实施条例.docx",
+    ]
+    assert all(
+        document.metadata["doc_name"] == "企业所得税法实施条例.docx" for document in turn.documents
+    )
+    # 同属一篇文档的多个片段只查一次
+    assert resolver.calls == [["doc-a"]]
+    prompt = model.received[0][-1].content
+    assert isinstance(prompt, str)
+    assert "来源：企业所得税法实施条例.docx（第 1 页）" in prompt
+    assert "doc-a" not in prompt
+
+
+def test_unknown_doc_id_falls_back_to_doc_id() -> None:
+    model = ScriptedChatModel(responses=[AIMessage(content="答案一")])
+    graph, _ = make_graph(model, resolver=FakeDocumentNameResolver())
+
+    turn = ask_rag_chat(graph, "业务招待费的扣除标准是什么？")
+
+    assert turn.documents[0].metadata["source"] == "doc-a"
+    prompt = model.received[0][-1].content
+    assert isinstance(prompt, str)
+    assert "来源：doc-a（第 1 页）" in prompt
+
+
+def test_name_lookup_failure_does_not_break_answer() -> None:
+    class BrokenResolver:
+        def resolve(self, doc_ids: Any) -> Any:
+            raise RuntimeError("MySQL 挂了")
+
+    model = ScriptedChatModel(responses=[AIMessage(content="答案一")])
+    graph, _ = make_graph(model, resolver=BrokenResolver())
+
+    turn = ask_rag_chat(graph, "业务招待费的扣除标准是什么？")
+
+    assert turn.answer == "答案一"
+    assert turn.documents[0].metadata["source"] == "doc-a"
+
+
+def test_graph_without_mysql_keeps_doc_id_source() -> None:
+    """没配 MySQL 时默认解析器静默跳过，问答仍可用，来源退回 doc_id。"""
+    model = ScriptedChatModel(responses=[AIMessage(content="答案一")])
+    graph = build_rag_chat_graph(
+        llm=model,
+        searcher=FakeSearcher(),
+        settings=Settings(_env_file=None),
+    )
+
+    turn = ask_rag_chat(graph, "业务招待费的扣除标准是什么？")
+
+    assert turn.answer == "答案一"
+    assert turn.documents[0].metadata["source"] == "doc-a"
+
+
 def test_follow_up_rewrites_query_with_history() -> None:
     model = ScriptedChatModel(
         responses=[
@@ -135,13 +211,14 @@ def test_follow_up_rewrites_query_with_history() -> None:
     answer_prompt = answer_messages[-1].content
     assert isinstance(answer_prompt, str)
     assert "【参考资料】" in answer_prompt
-    assert "[1] 来源：doc-a（第 1 页）" in answer_prompt
+    assert f"[1] 来源：{_FILE_NAME}（第 1 页）" in answer_prompt
     assert "那业务招待费呢" in answer_prompt
 
 
 def test_no_context_skips_llm() -> None:
     model = ScriptedChatModel(responses=[AIMessage(content="不应被调用")])
-    graph, searcher = make_graph(model, count=0)
+    resolver = FakeDocumentNameResolver({"doc-a": _FILE_NAME})
+    graph, searcher = make_graph(model, count=0, resolver=resolver)
 
     turn = ask_rag_chat(graph, "知识库里没有的问题")
 
@@ -149,6 +226,8 @@ def test_no_context_skips_llm() -> None:
     assert turn.documents == []
     assert model.calls == 0
     assert searcher.queries == ["知识库里没有的问题"]
+    # 没有召回片段就不必回查文件名
+    assert resolver.calls == []
 
 
 def test_stream_mode_emits_answer_tokens_only() -> None:
@@ -177,4 +256,5 @@ def test_stream_mode_emits_answer_tokens_only() -> None:
     assert "".join(tokens) == "企业所得税的扣除项目"
     updates = [payload for mode, payload in events if mode == "updates"]
     assert any("retrieve" in update for update in updates)
+    assert any("resolve" in update for update in updates)
     assert any("answer" in update for update in updates)

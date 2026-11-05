@@ -20,5 +20,5 @@ def configure_logging(level: str | None = None) -> None:
     root.addHandler(handler)
     root.setLevel(getattr(logging, resolved, logging.INFO))
     # These libraries are chatty at INFO level.
-    for noisy in ("httpx", "httpcore", "openai", "chromadb", "urllib3"):
+    for noisy in ("httpx", "httpcore", "openai", "pymilvus", "urllib3"):
         logging.getLogger(noisy).setLevel(logging.WARNING)

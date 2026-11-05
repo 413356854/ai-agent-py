@@ -13,7 +13,6 @@ from ai_agent_py.db.document_jobs import (
     to_params,
 )
 from ai_agent_py.mineru.models import (
-    IngestInfo,
     JobState,
     ParseJob,
     ParseOptions,
@@ -59,14 +58,6 @@ def _full_job() -> ParseJob:
         zip_file="mineru.zip",
         markdown_chars=4884,
         asset_count=0,
-        ingest=IngestInfo(
-            chunks=12,
-            characters=4884,
-            collection="rag_docs",
-            store="Chroma",
-            source="/srv/data/parsed/full.md",
-            ingested_at=_CREATED + timedelta(minutes=1),
-        ),
         rag_ingest=RagIngestInfo(
             chunks=12,
             characters=4884,
@@ -95,14 +86,12 @@ def test_roundtrip_keeps_every_field() -> None:
 def test_roundtrip_without_ingest() -> None:
     job = _full_job().model_copy(
         update={
-            "ingest": None,
             "rag_ingest": None,
             "started_at": None,
             "finished_at": None,
         }
     )
     restored = from_row(to_params(job))
-    assert restored.ingest is None
     assert restored.rag_ingest is None
     assert restored.rag_ingested is False
     assert restored.started_at is None

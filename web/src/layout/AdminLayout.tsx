@@ -8,6 +8,7 @@ import {
   MessageOutlined,
   RobotOutlined,
   TableOutlined,
+  ThunderboltOutlined,
 } from '@ant-design/icons'
 import { Breadcrumb, Button, Layout, Menu, Space, Tag, Tooltip, Typography } from 'antd'
 import type { MenuProps } from 'antd'
@@ -37,6 +38,7 @@ const MENU_ITEMS: MenuProps['items'] = [
     children: [
       { key: '/agents', icon: <RobotOutlined />, label: '应用列表' },
       { key: '/agents/reimburse', icon: <AuditOutlined />, label: '报销审核' },
+      { key: '/agents/general', icon: <ThunderboltOutlined />, label: '通用 Agent' },
     ],
   },
 ]
@@ -48,6 +50,7 @@ const PAGE_TITLES: Record<string, string> = {
   '/rag/chat': 'RAG 问答',
   '/agents': '应用列表',
   '/agents/reimburse': '报销审核',
+  '/agents/general': '通用 Agent',
 }
 
 function readSiderCollapsed(): boolean {
@@ -94,7 +97,7 @@ export function AdminLayout() {
           {!collapsed && (
             <div className="brand-text">
               <div className="brand-title">ai-agent-py</div>
-              <div className="brand-sub">RAG 控制台</div>
+              <div className="brand-sub">RAG · Agent 控制台</div>
             </div>
           )}
         </div>

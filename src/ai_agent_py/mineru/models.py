@@ -71,23 +71,8 @@ class ParseOptions(BaseModel):
         }
 
 
-class IngestInfo(BaseModel):
-    """解析结果写入 Chroma 向量库后的摘要（``/ingest`` 接口）。"""
-
-    chunks: int = 0
-    characters: int = 0
-    collection: str = ""
-    store: str = ""
-    source: str = ""
-    ingested_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
-
-
 class RagIngestInfo(BaseModel):
-    """解析结果写入 Milvus ``rag_chunk`` 后的摘要（``/rag`` 接口）。
-
-    与 `IngestInfo`（Chroma 入库）分开记录：同一份文档可以既写入 Chroma
-    又写入 RAG 表，两者的状态互不覆盖。
-    """
+    """解析结果写入 Milvus ``rag_chunk`` 后的摘要（``/rag`` 接口）。"""
 
     chunks: int = 0
     characters: int = 0
@@ -156,7 +141,6 @@ class ParseJob(BaseModel):
     markdown_chars: int = 0
     asset_count: int = 0
 
-    ingest: IngestInfo | None = None
     #: 最近一次写入 Milvus ``rag_chunk`` 的摘要；非空即「已入库」。
     rag_ingest: RagIngestInfo | None = None
 
@@ -222,14 +206,3 @@ class DocumentConfigOut(BaseModel):
     rag_database: str = ""
     rag_collection: str = ""
     rag_dim: int = 0
-
-
-class IngestResultOut(BaseModel):
-    """入库接口响应。"""
-
-    job_id: str
-    chunks: int
-    characters: int
-    collection: str
-    store: str
-    source: str

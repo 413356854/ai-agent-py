@@ -41,9 +41,25 @@ def build_agent_node(
 
 def build_tool_node(
     tools: Sequence[BaseTool],
+    *,
+    result_formatter: Callable[[str], str] | None = None,
 ) -> Callable[[AgentState], Any]:
-    """Node that runs every tool call requested by the last AI message."""
+    """Node that runs every tool call requested by the last AI message.
+
+    ``result_formatter`` 只改模型可见的 ``ToolMessage.content``（用于通用 Agent 的
+    工具输出预算）；完整结果始终放在 ``ToolMessage.artifact['raw']``，供落库/界面展示。
+    """
     by_name = {tool.name: tool for tool in tools}
+    formatter = result_formatter or str
+
+    def _tool_message(content: str, *, call_id: str, name: str) -> ToolMessage:
+        visible = formatter(content)
+        return ToolMessage(
+            content=visible,
+            tool_call_id=call_id,
+            name=name,
+            artifact={"raw": content, "truncated": visible != content},
+        )
 
     def tool_node(state: AgentState) -> dict[str, list[AnyMessage]]:
         """Node: run every tool call from the last AI message and append ToolMessages."""
@@ -58,15 +74,15 @@ def build_tool_node(
             call_id = str(payload.get("id") or "")
             tool = by_name.get(name)
             if tool is None:
-                outputs.append(ToolMessage(content=f"未知工具：{name}", tool_call_id=call_id))
+                outputs.append(_tool_message(f"未知工具：{name}", call_id=call_id, name=name))
                 continue
             try:
                 result = tool.invoke(payload.get("args") or {})
             except Exception as exc:  # report back to the model
                 logger.exception("Tool %s failed", name)
-                outputs.append(ToolMessage(content=f"工具执行失败：{exc}", tool_call_id=call_id))
+                outputs.append(_tool_message(f"工具执行失败：{exc}", call_id=call_id, name=name))
             else:
-                outputs.append(ToolMessage(content=str(result), tool_call_id=call_id))
+                outputs.append(_tool_message(str(result), call_id=call_id, name=name))
 
         return {"messages": outputs}
 

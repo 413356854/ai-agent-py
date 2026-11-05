@@ -1,4 +1,14 @@
-"""Ingestion pipeline: files -> documents -> chunks -> embeddings -> store."""
+"""Ingestion pipeline: files -> documents -> chunks -> embeddings -> Milvus ``rag_chunk``.
+
+这是「本地目录建索引」的入口（``ai-agent-py ingest``）。它与「文档解析 → 入库 RAG」
+共用同一个写入器 `rag.milvus.MilvusRagWriter`，所以两条入口最终都写进 ``rag_chunk``
+一张表，检索侧（`rag.milvus_search.MilvusChunkSearcher`）不再区分数据来自哪条链路。
+
+* 一个源文件 = 一个 ``doc_id``（``doc-`` + 相对路径 sha1 的前 16 位）；同一路径重复入库
+  时按 ``doc_id`` 先删后写，换切分参数也不会留下孤儿块；
+* 写入器通过 ``writer=`` 注入：离线演示与单元测试用 `offline.OfflineChunkSearcher`，
+  既不需要 Milvus，也不需要 embedding Key。
+"""
 
 from __future__ import annotations
 
@@ -8,22 +18,26 @@ import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from langchain_core.documents import Document
-from langchain_core.embeddings import Embeddings
-from langchain_core.vectorstores import VectorStore
 
 from ai_agent_py.config import Settings, get_settings
-from ai_agent_py.errors import AiAgentError
 from ai_agent_py.rag.loaders import load_documents
 from ai_agent_py.rag.splitter import split_documents
-from ai_agent_py.rag.store import build_vector_store, clear_vector_store, store_kind
 
 logger = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[int, int], None]
 """Called as ``on_progress(done_chunks, total_chunks)``."""
+
+
+class ChunkWriter(Protocol):
+    """写入器协议：`MilvusRagWriter` 与离线用的内存写入器都满足它。"""
+
+    def index_document(self, doc_id: str, chunks: Sequence[Document]) -> Any:
+        """覆盖写入一篇文档的全部切片（先删同 ``doc_id`` 的旧切片）。"""
+        ...
 
 
 @dataclass(slots=True)
@@ -34,9 +48,8 @@ class IngestReport:
     documents: int
     chunks: int
     characters: int
-    batches: int
-    store: str
     collection: str
+    store: str
     elapsed_seconds: float
 
     def as_dict(self) -> dict[str, Any]:
@@ -45,41 +58,30 @@ class IngestReport:
             "documents": self.documents,
             "chunks": self.chunks,
             "characters": self.characters,
-            "batches": self.batches,
-            "store": self.store,
             "collection": self.collection,
+            "store": self.store,
             "elapsed_seconds": round(self.elapsed_seconds, 2),
         }
 
 
-def chunk_id(document: Document) -> str:
-    """Stable id so re-ingesting the same chunk updates instead of duplicating."""
-    key = "|".join(
-        str(document.metadata.get(field, "")) for field in ("source", "page", "chunk_index")
-    )
-    digest = hashlib.sha1(f"{key}|{document.page_content}".encode()).hexdigest()
-    return f"chunk-{digest[:32]}"
+def document_id(source: str) -> str:
+    """源文件 → 稳定的 ``doc_id``：同一个文件重新入库时覆盖旧切片。"""
+    return f"doc-{hashlib.sha1(source.encode('utf-8')).hexdigest()[:16]}"
 
 
 def ingest(
     paths: Sequence[str | Path] | None = None,
     *,
-    store: VectorStore | None = None,
-    embeddings: Embeddings | None = None,
+    writer: ChunkWriter | None = None,
     settings: Settings | None = None,
-    recreate: bool = False,
     chunk_size: int | None = None,
     chunk_overlap: int | None = None,
-    batch_size: int | None = None,
     on_progress: ProgressCallback | None = None,
 ) -> IngestReport:
     """Load, split and index everything below `paths` (defaults to `DATA_DIR`)."""
     started = time.perf_counter()
     cfg = settings or get_settings()
     targets: list[str | Path] = list(paths) if paths else [cfg.data_dir]
-    batch = batch_size or cfg.embedding_batch_size
-    if batch <= 0:
-        raise ValueError("batch_size must be positive")
 
     documents = load_documents(targets)
     chunks = split_documents(
@@ -90,57 +92,41 @@ def ingest(
     )
     logger.info("Loaded %d documents -> %d chunks", len(documents), len(chunks))
 
-    active_store = store or build_vector_store(embeddings=embeddings, settings=cfg)
-    if recreate:
-        clear_vector_store(active_store)
-        logger.info("Vector store cleared before ingestion")
-
-    batches = _add_in_batches(
-        active_store,
-        chunks,
-        batch_size=batch,
-        on_progress=on_progress,
-    )
+    # 注意不能用 `writer or ...`：离线检索器实现了 __len__，空库时布尔值为 False。
+    active = writer if writer is not None else _default_writer(cfg)
+    groups = group_by_source(chunks)
+    total = len(chunks)
+    done = 0
+    if on_progress is not None:
+        on_progress(0, total)
+    for source, window in groups.items():
+        active.index_document(document_id(source), window)
+        done += len(window)
+        if on_progress is not None:
+            on_progress(done, total)
 
     return IngestReport(
-        files=len({str(doc.metadata.get("source")) for doc in documents}),
+        files=len(groups),
         documents=len(documents),
-        chunks=len(chunks),
+        chunks=total,
         characters=sum(len(chunk.page_content) for chunk in chunks),
-        batches=batches,
-        store=store_kind(active_store),
-        collection=cfg.collection_name,
+        collection=str(getattr(active, "collection", "") or ""),
+        store=type(active).__name__,
         elapsed_seconds=time.perf_counter() - started,
     )
 
 
-def _add_in_batches(
-    store: VectorStore,
-    chunks: Sequence[Document],
-    *,
-    batch_size: int,
-    on_progress: ProgressCallback | None,
-) -> int:
-    total = len(chunks)
-    if not total:
-        return 0
+def group_by_source(chunks: Sequence[Document]) -> dict[str, list[Document]]:
+    """按 ``metadata['source']`` 分组：一个源文件写一次，便于按 ``doc_id`` 覆盖。"""
+    groups: dict[str, list[Document]] = {}
+    for chunk in chunks:
+        source = str(chunk.metadata.get("source") or "unknown")
+        groups.setdefault(source, []).append(chunk)
+    return groups
 
-    if on_progress is not None:
-        on_progress(0, total)
 
-    done = 0
-    batches = 0
-    for start in range(0, total, batch_size):
-        window = list(chunks[start : start + batch_size])
-        ids = [chunk_id(chunk) for chunk in window]
-        try:
-            store.add_documents(window, ids=ids)
-        except Exception as exc:  # surface a actionable message
-            raise AiAgentError(
-                f"写入向量库失败。若是因为重复 id，请加 `--recreate` 重建索引。原始错误: {exc}"
-            ) from exc
-        batches += 1
-        done += len(window)
-        if on_progress is not None:
-            on_progress(done, total)
-    return batches
+def _default_writer(settings: Settings) -> ChunkWriter:
+    # 延迟导入：只有真正写 Milvus 时才需要 pymilvus / embedding 依赖。
+    from ai_agent_py.rag.milvus import MilvusRagWriter
+
+    return MilvusRagWriter(settings=settings)

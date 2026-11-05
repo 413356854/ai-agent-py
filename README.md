@@ -6,27 +6,32 @@
 「加载 → 切块 → 向量化 → 检索 → 生成」全流程；配置好 `.env` 后即可切换成真实模型。
 
 ```text
-┌──────────┐   loaders   ┌──────────┐  splitter  ┌────────┐  embeddings  ┌────────┐
-│ txt/md   │ ──────────▶ │ Document │ ─────────▶ │ chunks │ ───────────▶ │ Chroma │
-│ pdf/docx │             └──────────┘            └────────┘              └────┬───┘
-└──────────┘                                                                 │
-                                        ┌───────────────────────────────────┘
-   问题 ──────────────────────────────▶ retriever ──▶ 相关片段（带来源）
+┌──────────┐   loaders   ┌──────────┐  splitter  ┌────────┐  embeddings  ┌──────────────────┐
+│ txt/md   │ ──────────▶ │ Document │ ─────────▶ │ chunks │ ───────────▶ │ Milvus rag_chunk │
+│ pdf/docx │             └──────────┘            └────────┘              └────────┬─────────┘
+└──────────┘                                                                       │
+                                        ┌──────────────────────────────────────────┘
+   问题 ──────────────────────────────▶ 混合检索 ──▶ 相关片段（带来源）
      │
      ├─ RAG 链（LCEL）：  prompt(上下文 + 问题) → LLM → 答案 + 引用
      ├─ 智能体（LangGraph）： agent ⇄ tools(search_knowledge_base) → 答案
-     └─ RAG 问答（LangGraph）： condense → retrieve(Milvus rag_chunk) → answer
-                                → SSE 流式答案 + 引用片段
+     ├─ RAG 问答（LangGraph）： condense → retrieve(Milvus rag_chunk)
+     │                          → resolve(MySQL 文件名) → answer
+     │                          → SSE 流式答案 + 引用片段
+     └─ 通用 Agent（LangGraph）： agent ⇄ 全部工具（文件 / 命令 / 知识库 / 联网）
+                                → MySQL 会话记忆 + SSE 实时工具调用
 ```
 
 ## 特性
 
-- **三套调用路径，按场景选择**
+- **四套调用路径，按场景选择**
   - RAG 链（LCEL）：检索一次即生成，延迟低、成本可控，适合问答接口。
   - LangGraph 智能体：`agent ⇄ tools` 状态图，模型自己决定要不要检索、检索几轮。
-  - RAG 问答（LangGraph 固定链）：`condense → retrieve(Milvus) → answer`，多轮改写 + 混合检索 +
-    精排 + 引用，前端 SSE 流式渲染。
-- **可插拔**：对话模型、向量模型、向量库、文件类型都通过配置或依赖注入替换，业务代码不动。
+  - RAG 问答（LangGraph 固定链）：`condense → retrieve(Milvus) → resolve(MySQL 文件名) → answer`，
+    多轮改写 + 混合检索 + 精排 + 文件名引用，前端 SSE 流式渲染。
+  - 通用 Agent（LangGraph ReAct + 全部工具）：文件 / 命令 / 知识库 / 联网都能用，
+    会话记忆落 MySQL，前端 SSE 实时展示工具调用。
+- **可插拔**：对话模型、向量模型、检索器（`DocumentSearcher` 协议）、文件类型都通过配置或依赖注入替换，业务代码不动。
 - **结构化切分 + 缓存式入库 RAG**：切分统一读解析结果 `markdown_file`（JSON 直读任务从
   `full.md` 的代码块还原原文后按结构切），切片在服务端 HashMap 里缓存并返回 `split_id`；
   前端「切分」弹窗把切片逐条展示给用户查阅，点「入库 RAG」时只回传 `split_id`
@@ -50,9 +55,10 @@
   文档分布与向量维度；文档名按 `doc_id` 从 MySQL 任务表回查，一键跳到「文档解析」看原文。
   列表先按 `(doc_id, chunk_index)` 全局排序再回查正文，翻页时块序号连续、可读；内容只展示前两行，
   **点击整格可在弹窗查看完整片段**（含文档 ID、块 ID、页码、字数）并一键复制全文。
-- **RAG 问答**：聊天式问答页 + **LangGraph** 编排的 `condense → retrieve → answer` 图：
+- **RAG 问答**：聊天式问答页 + **LangGraph** 编排的 `condense → retrieve → resolve → answer` 图：
   多轮追问先改写成独立问题，再在 `rag_chunk` 上做稠密 + BM25 + RRF 混合检索，RRF 后再用
-  `qwen3.7-text-rerank` 精排，最后带 `[1] [2]` 引用作答；答案通过 **SSE 逐 token 推送**，
+  `qwen3.7-text-rerank` 精排；检索后按 `doc_id` 回查 MySQL 文件名，让模型在提示词里看到
+  「来源：xxx.docx」而不是 `doc-1a2b…`，最后带 `[1] [2]` 引用作答。答案通过 **SSE 逐 token 推送**，
   引用片段可点开查看原文与相关度；页头标签实时显示 LLM 模型、检索方式与精排是否启用。
   （没有 Embedding Key 时自动退化为 BM25 关键词检索；没有精排 Key 时跳过精排；没有 LLM Key
   时页面给出明确提示。）
@@ -61,6 +67,14 @@
   判定器注册表）。后台「Agent 应用」栏目直接展示 **`get_graph().draw_mermaid()` 导出的流程图**，
   可切换主题、查看原始 Mermaid 源码；试跑页支持**下载填充好的 xlsx 样板 / 空白模板**，
   也可以**直接上传填好的单据（xlsx / json）**解析后试跑；语义疑点只会转人工，不会自动退回。
+- **通用 Agent（全部工具 + MySQL 会话记忆）**：后台「Agent 应用 → 通用 Agent」是一张
+  LangChain / LangGraph 的 `agent ⇄ tools` 图，**一次接入全部工具**：知识库检索
+  （`search_knowledge_base`）、文件读写（`read` / `write` / `edit` / `glob` / `grep`）、
+  命令执行（`shell`）、联网（`web_search` / `web_extract`）。对话通过 **SSE 流式输出**，
+  工具调用（名称 / 入参 / 结果 / 耗时）实时展示；**会话记忆落在 MySQL**
+  （`tb_agent_chat_session` / `tb_agent_chat_message` / `tb_agent_chat_summary`），
+  刷新页面、重启服务后仍可回放并继续追问。**上下文压缩**分三层：工具输出头尾修剪、
+  历史 token 预算、MySQL 滚动摘要（8 节结构化检查点），并支持溢出重试与手动压缩。
 - **中文友好**：分块规则针对中文标点调优，提示词与 CLI / 前端输出均为中文。
 
 ## 目录结构
@@ -76,29 +90,28 @@ ai-agent-py/
 │   └── milvus-stop.ps1       # 停止 Milvus（SIGTERM，等待 19530 端口关闭）
 ├── data/
 │   ├── raw/                  # 待索引文档（内置 sample.md）
-│   ├── parsed/               # MinerU 解析结果（Markdown + 图片；任务记录在 MySQL）
-│   └── chroma/               # Chroma 持久化目录（可随时删除重建）
+│   └── parsed/               # MinerU 解析结果（Markdown + 图片；任务记录在 MySQL）
 ├── src/ai_agent_py/
 │   ├── config.py             # pydantic-settings：全部配置项 + 脱敏描述
 │   ├── llm.py                # 对话模型 / 向量模型工厂（OpenAI 兼容协议）
-│   ├── offline.py            # 离线用的占位模型与哈希向量（demo & 测试）
+│   ├── offline.py            # 离线用的占位模型、哈希向量与内存检索器（demo & 测试）
 │   ├── cli.py                # 命令行：info/db/ingest/ask/chat/demo/parse/serve
 │   ├── db/
 │   │   ├── dsn.py            # JDBC mysql:// → mysql+pymysql://（字符集 / 时区 / 超时）
 │   │   ├── health.py         # 连接池 + 只读健康检查（版本 / 库 / 表数 / 连接池）
-│   │   └── document_jobs.py  # tb_document_parse_job 的行映射与 upsert / 查询 / 删除
+│   │   ├── document_jobs.py  # tb_document_parse_job 的行映射与 upsert / 查询 / 删除
+│   │   └── agent_chat.py     # 通用 Agent 会话/消息/摘要：三张表读写、摘要条件更新
 │   ├── rag/
 │   │   ├── loaders.py        # txt/md/pdf/docx → Document（含编码回退、页码）
 │   │   ├── splitter.py       # 按后缀：Markdown / HTML / JSON / 递归切分
 │   │   ├── chunk_cache.py    # 切分结果缓存：split_id → 完整切片（TTL + LRU）
 │   │   ├── milvus.py         # 切分块写入 Milvus rag_chunk（稠密 + BM25，覆盖写）
 │   │   ├── milvus_search.py  # rag_chunk 混合检索（稠密 + BM25 + RRF + 精排，缺 Key 退 BM25）
+│   │   ├── doc_names.py      # 检索后按 doc_id 回查 MySQL 文件名（批量 + 缓存 + 降级）
 │   │   ├── rerank.py         # RRF 之后精排：qwen3.7-text-rerank（DashScope 原生接口）
 │   │   ├── records.py        # rag_chunk 只读查询（RAG 记录列表 / 文档分布）
 │   │   ├── models.py         # 切分预览 / RAG 入库 / RAG 记录 / 问答的接口模型
-│   │   ├── store.py          # 向量库：chroma / memory
-│   │   ├── ingest.py         # 建索引流水线（稳定 id、分批、进度回调）
-│   │   ├── retriever.py      # similarity / mmr / score_threshold 检索器
+│   │   ├── ingest.py         # 建索引流水线：按源文件覆盖写 rag_chunk（进度回调）
 │   │   └── chain.py          # RAG 提示词、LCEL 链、答案与引用
 │   ├── mineru/               # MinerU 精准解析 API 对接
 │   │   ├── client.py         # 异步 httpx：申请上传链接 / PUT / 轮询 / 下载
@@ -109,8 +122,14 @@ ai-agent-py/
 │   │   ├── state.py          # AgentState（messages + add_messages 归并）
 │   │   ├── nodes.py          # agent 节点、tools 节点、条件路由
 │   │   ├── agent.py          # 组装并编译 StateGraph
-│   │   └── rag_chat.py       # RAG 问答图：condense → retrieve → answer
-│   ├── tools/__init__.py     # 智能体可用工具（检索工具，可扩展）
+│   │   └── rag_chat.py       # RAG 问答图：condense → retrieve → resolve → answer
+│   ├── tools/
+│   │   ├── __init__.py       # 工具出口：检索工具 + 通用工具构建函数
+│   │   ├── workspace.py      # 工作目录约束、忽略目录、glob → 正则
+│   │   ├── filesystem.py     # read / write / edit / glob / grep
+│   │   ├── shell.py          # shell 执行：超时、编码、输出截断
+│   │   ├── web_search.py     # 百炼联网搜索（DashScope 原生接口）
+│   │   └── web_extractor.py  # 百炼网页抓取（Responses API）
 │   ├── reimburse/            # 报销审核 Agent：规则库 + 9 节点图 + 图导出
 │   │   ├── rules.py          # 13 条规则（YAML 元数据 + 判定器注册表）
 │   │   ├── params.py         # 参数库存储：内存缓存 + 原子落盘 + 失效重载
@@ -118,14 +137,19 @@ ai-agent-py/
 │   │   ├── graph.py          # G1–G9 工序图，describe_graph() 导出 mermaid
 │   │   ├── samples.py        # 7 张合成样例单据（通过/退回/转人工）
 │   │   └── data/             # rules.yaml + policy_params.yaml（占位参数）
+│   ├── general/              # 通用 Agent：工具装配 / 提示词 / 上下文预算 / 摘要
+│   │   ├── agent.py          # build_general_tools / build_general_agent_graph / 自定义状态节点
+│   │   ├── context.py        # token 估算、历史选择、单条/单轮工具输出修剪
+│   │   └── summary.py        # 8 节结构化摘要 prompt 与摘要调用
 │   └── api/
 │       ├── app.py            # FastAPI：/query /chat /health /info + 前端托管
 │       ├── database.py       # MySQL 健康检查接口：/api/db/health
 │       ├── documents.py      # 文档解析接口：上传 / 状态 / 预览 / 下载 / 切分 / 入库
 │       ├── agents.py         # Agent 应用：列表 / 图导出 / 样例 / 试跑
+│       ├── general_agent.py  # 通用 Agent：概览 / MySQL 会话 / 对话（含 SSE 流式）
 │       └── rag.py            # RAG 记录列表 + RAG 问答（含 SSE 流式）
-├── web/                      # 管理后台（文档解析 / RAG 记录 / RAG 问答 / Agent 应用）
-└── tests/                    # pytest：加载、切分、链路、图、API、CLI、MinerU、MySQL、RAG 记录
+├── web/                      # 管理后台（文档解析 / RAG 记录 / RAG 问答 / Agent 应用 / 通用 Agent）
+└── tests/                    # pytest：加载、切分、链路、图、API、CLI、MinerU、MySQL、RAG、通用 Agent
 ```
 
 ## 快速开始
@@ -146,8 +170,8 @@ Copy-Item .env.example .env      # 然后编辑 .env：填 LLM_API_KEY（或导�
 # 4. 检查本地 MySQL（库已存在时只做连接检查）
 uv run ai-agent-py db check
 
-# 5. 建索引 + 提问
-uv run ai-agent-py ingest data/raw --recreate
+# 5. 建索引 + 提问（写入 Milvus rag_chunk）
+uv run ai-agent-py ingest data/raw
 uv run ai-agent-py ask "这个项目用什么管理依赖？"
 
 # 6. 管理后台（构建一次，之后由 FastAPI 直接托管）
@@ -165,7 +189,7 @@ bash / macOS 下把 `Copy-Item` 换成 `cp` 即可。前端需要 Node.js 20+ �
 | 命令 | 说明 |
 | --- | --- |
 | `uv run ai-agent-py demo` | 离线跑通全流程，验证代码与数据路径 |
-| `uv run ai-agent-py ingest [路径...] --recreate` | 建/重建索引，默认读取 `DATA_DIR` |
+| `uv run ai-agent-py ingest [路径...]` | 建索引（按源文件覆盖写 Milvus），默认读取 `DATA_DIR` |
 | `uv run ai-agent-py ask "问题"` | 单次问答（RAG 链），输出答案 + 引用片段 |
 | `uv run ai-agent-py ask "问题" --stream` | 流式输出（逐 token 打印） |
 | `uv run ai-agent-py chat` | 多轮对话（LangGraph 智能体，带工具调用与上下文） |
@@ -198,6 +222,13 @@ Invoke-RestMethod -Uri http://127.0.0.1:8000/query -Method Post `
 | GET | `/api/agents/{id}/template` | 空白报销单模板（xlsx） |
 | GET | `/api/agents/{id}/samples/{sid}/download` | 样例样板下载（`fmt=xlsx` 或 `json`） |
 | POST | `/api/agents/{id}/upload` | 上传填好的单据（xlsx/json）→ 解析成 claim |
+| GET | `/api/general-agent/overview` | **通用 Agent** 概览：对话模型、工作目录、全部工具、MySQL 会话记忆状态 |
+| GET | `/api/general-agent/sessions` | MySQL 会话列表（标题 / 消息数 / 最近更新时间） |
+| GET | `/api/general-agent/sessions/{id}/messages` | 会话消息回放（user / assistant / 工具调用记录，含 `compressed` 标记与摘要） |
+| POST | `/api/general-agent/sessions/{id}/compact` | 手动压缩更早历史（`{"keep": 8}` 可选），返回压缩条数与摘要 |
+| DELETE | `/api/general-agent/sessions/{id}` | 删除会话及其全部消息 |
+| POST | `/api/general-agent/chat` | 通用 Agent 对话（同步）：`answer` + 本轮新增的助手 / 工具消息 |
+| POST | `/api/general-agent/chat/stream` | 同上，SSE 流式：`session` →（`tool_call` → `tool_result`）… → `token`… → `done` |
 | GET | `/health` | 版本、模型、向量库、chunk 数与 MySQL 连接状态 |
 | GET | `/info` | 配置快照（密钥脱敏） |
 | GET | `/api/db/health` | MySQL 连接检查：服务端版本、库名、表数、时区、耗时、连接池 |
@@ -210,7 +241,6 @@ Invoke-RestMethod -Uri http://127.0.0.1:8000/query -Method Post `
 | GET | `/api/documents/{id}/chunks` | **切分预览**：读 `markdown_file` 切分，返回 `split_id` + 片段与统计 |
 | POST | `/api/documents/{id}/rag` | **按 `split_id` 从缓存取切片写入 Milvus** `db_tax_rag.rag_chunk`（可重复入库：先删旧切片；成功后任务记录 `rag_ingested=true`） |
 | DELETE | `/api/documents/{id}` | 删除任务、结果与源文件 |
-| POST | `/api/documents/{id}/ingest` | 把解析结果写入 Chroma（`VECTOR_STORE`） |
 | GET | `/parsed/{id}/images/...` | 解析结果里的图片（Markdown 预览用） |
 | GET | `/api/rag/overview` | **RAG 记录 / 问答**概览：Milvus 连接、总块数、文档分布、模型配置状态（含精排 `rerank_model` / `rerank_configured`） |
 | GET | `/api/rag/chunks` | **`rag_chunk` 记录列表**：`doc_id` / `keyword` / `page` / `page_size` |
@@ -248,9 +278,9 @@ Invoke-RestMethod -Uri http://127.0.0.1:8000/query -Method Post `
 - **重复入库**：每次写 Milvus 前先按 `doc_id` 删除该文档的**全部**旧切片，再 `upsert`
   本次切片；换 `chunk_size` / 修改正文后重新入库不会留下孤儿块或重复块。embedding
   计算成功后才执行删除，向量模型失败不会先丢掉旧数据。
-- **已入库状态**：RAG 入库成功后任务记录写入独立的 `rag_ingest`（块数、字符数、目标集合、
+- **已入库状态**：RAG 入库成功后任务记录写入 `rag_ingest`（块数、字符数、目标集合、
   入库时间），列表「状态」列在解析状态下方显示「已入库」；重新入库只刷新这份摘要，
-  可以反复操作。它与 Chroma 入库的 `ingest` 分开，两者互不覆盖。
+  可以反复操作。
 - 向量模型默认走阿里云百炼 OpenAI 兼容接口：`DASHSCOPE_API_KEY` +
   `text-embedding-v4` + `EMBEDDING_DIMENSIONS=1536`（必须等于 `MILVUS_DIM`）。
 - `sparse`（BM25）由 Milvus 服务端根据 `content` 生成，应用写入时不赋值。
@@ -306,8 +336,8 @@ Invoke-RestMethod "http://127.0.0.1:8000/api/rag/chunks?keyword=业务招待费&
 ### RAG 问答（`graph/rag_chat.py`，LangGraph）
 
 ```text
-START ──▶ condense ──▶ retrieve ──▶ answer ──▶ END
-            改写追问      Milvus 检索    带引用作答
+START ──▶ condense ──▶ retrieve ──▶ resolve ──▶ answer ──▶ END
+            改写追问      Milvus 检索    回查文件名    带引用作答
 ```
 
 - **condense**：首轮直接使用用户问题，**不额外调模型**；存在历史对话时，才让 LLM 把
@@ -317,6 +347,10 @@ START ──▶ condense ──▶ retrieve ──▶ answer ──▶ END
   `RERANK_CANDIDATES` 条候选交给 `qwen3.7-text-rerank` 重新打分，最后取 `RETRIEVER_K` 条。
   精排失败（超时 / 401 / 配额）只记 warning 并退回 RRF 顺序，不影响问答可用性；没配精排 Key
   时这一步直接跳过（等价于只用 RRF）；
+- **resolve**：`rag_chunk` 只有 `doc_id`，文件名在 MySQL `tb_document_parse_job`。这里按本次
+  召回的 id 批量回查文件名（`WHERE id IN (...)`，同一篇文档的多个片段只查一次，结果进程内
+  缓存），写回片段 `metadata["source"]`，所以模型看到的来源是「xxx.docx」而不是
+  「doc-1a2b…」。MySQL 未配置 / 宕机 / 表不存在时只记 warning，来源退回 `doc_id`，问答照常；
 - **answer**：把片段按 `[1] [2]` 编号拼进提示词，并声明「共 N 条，编号 1~N」；**没有召回时
   不调用 LLM**，直接返回兜底文案（省钱、避免幻觉）；
 - **引用校正**：模型偶尔把法条序号当来源编号（「第四十三条」写成 `[43]`）。提示词里明确禁止并
@@ -326,8 +360,8 @@ START ──▶ condense ──▶ retrieve ──▶ answer ──▶ END
 - 多轮上下文由 LangGraph `InMemorySaver` 按 `thread_id` 保存在**服务端进程内**：刷新页面后
   点「新会话」换一个 `thread_id` 即可重新开始；服务重启后旧会话失效；
 - 前端用 `POST /api/rag/chat/stream`（SSE）逐 token 渲染，事件顺序为
-  `stage`（检索中）→ `sources`（引用片段）→ 若干 `token` → `done`（完整答案，以它为准）；
-  出错时发 `error` 事件；
+  `stage`（检索中）→ `sources`（引用片段，`resolve` 补完文件名后发送）→ 若干 `token`
+  → `done`（完整答案，以它为准）；出错时发 `error` 事件；
 - 降级：没有 `EMBEDDING_API_KEY` 时只走 BM25 关键词检索（集合本来就带 analyzer / BM25，
   `content` 就是索引字段）；连 `LLM_API_KEY` / `DASHSCOPE_API_KEY` 都没有时页面会提示
   「问答不可用」，接口返回 503。
@@ -347,10 +381,11 @@ curl.exe -N -X POST http://127.0.0.1:8000/api/rag/chat/stream `
   -d '{"message":"业务招待费的扣除标准是什么？","thread_id":"demo-1"}'
 ```
 
-## Milvus 通用业务 RAG 表
+## Milvus 通用业务 RAG 表（唯一向量库）
 
-默认链路走 Chroma，够用；需要**生产级混合检索**（稠密语义 + BM25 关键词 + RRF 融合 +
-qwen3.7 精排 + 页码引用）时，用 Milvus 存检索块。脚本在 `docs/milvus/`：
+Milvus `rag_chunk` 是**唯一**的向量库：`/query`、智能体的 `search_knowledge_base` 工具、
+「RAG 问答」、`ai-agent-py ingest` 与「入库 RAG」全部读写这一张表，不再有第二套索引。
+它提供稠密语义 + BM25 关键词 + RRF 融合 + qwen3.7 精排 + 页码引用。脚本在 `docs/milvus/`：
 
 - [`create_database.py`](docs/milvus/create_database.py)：建库 `db_tax_rag`（幂等，可设副本/资源组/配额）；
 - [`create_rag_chunk.py`](docs/milvus/create_rag_chunk.py)：建表 `rag_chunk`，**7 字段 + 3 索引 + BM25 函数**。
@@ -395,7 +430,8 @@ wsl -d Ubuntu-20.04 -- tail -f /home/ljf/milvus/milvus.log
 - 一行 = 一个检索块，只有 7 个字段：`chunk_id` / `doc_id` / `chunk_index` / `page` /
   `content` / `embedding` / `sparse`；
 - **文档级属性不进 Milvus**：文件名、后缀、页数、时间在 MySQL `tb_document_parse_job`，
-  `doc_id` 就是该表的 `id`，检索后按它回查拼引用（避免改标题要更新 N 行）；
+  `doc_id` 就是该表的 `id`，检索后由 `rag/doc_names.py` 按它回查文件名拼引用
+  （避免改标题要更新 N 行）；
 - 一个集合两路向量：`embedding`（稠密）+ `sparse`（BM25，服务端自动生成，**不要手写**）；
 - 主键是稳定 `chunk_id`（`sha1(doc_id|chunk_index|content)`），重灌幂等，不会产生重复块；
 - `content` 开 analyzer 后同时作为 BM25 输入；`page` 用于引用回溯（PDF 有，docx 转 md 为 NULL）；
@@ -406,7 +442,8 @@ wsl -d Ubuntu-20.04 -- tail -f /home/ljf/milvus/milvus.log
 应用侧写入在 `src/ai_agent_py/rag/milvus.py`（`MilvusRagWriter`）：按 `doc_id` 覆盖写、
 只写 `content` + `embedding`（`sparse` 由服务端生成）、删除旧块后 `upsert` 并 flush。
 读取在 `rag/records.py`（记录列表），混合检索（`embedding` + `sparse` + RRF）在
-`rag/milvus_search.py`，已接入「RAG 问答」（`/api/rag/chat`）；`/query` 仍走 Chroma 链路。
+`rag/milvus_search.py`：`/query`、智能体检索工具、「RAG 问答」（`/api/rag/chat`）与
+`ai-agent-py ask/chat` 都走这一条链路，同一份资料只有一套索引。
 
 ## MySQL 对接（只读健康检查）
 
@@ -503,7 +540,7 @@ Invoke-RestMethod http://127.0.0.1:8000/api/db/health
                                                     │
 浏览器 ──轮询──▶ GET /api/documents/{id} ◀──── 状态：uploading → parsing → done
          └──────▶ GET /api/documents/{id}/markdown（预览，图片走 /parsed/<job>/）
-         └──────▶ POST /api/documents/{id}/ingest（切块写入 Chroma）
+         └──────▶ POST /api/documents/{id}/chunks（切分预览）→ POST /api/documents/{id}/rag（写入 Milvus）
 ```
 
 - **异步任务**：`POST /parse` 立刻返回，前端每 2.5s 轮询一次，不占用 HTTP 连接。
@@ -516,9 +553,9 @@ Invoke-RestMethod http://127.0.0.1:8000/api/db/health
   只有本进程正在解析的任务走内存对象（页数进度比库里更新），避免进度回退。
 - **结果落盘**：`data/parsed/<job_id>/`（`full.md`、`images/`、`mineru.zip`、`source.*`），
   删除任务会一并删除该目录。`.md` / `.json` 不走 MinerU，上传后立刻标记完成。
-- **两种入库**：行内「入库」把 Markdown 写进 Chroma（`COLLECTION_NAME`）；「切分 →
-  查阅 → 入库 RAG」把服务端缓存的切片写进 Milvus `db_tax_rag.rag_chunk`。前者缺
-  `EMBEDDING_API_KEY`、后者缺 `DASHSCOPE_API_KEY` / `EMBEDDING_API_KEY` 时都返回 503 并给出提示。
+- **入库**：「切分 → 查阅 → 入库 RAG」把服务端缓存的切片写进 Milvus
+  `db_tax_rag.rag_chunk`（唯一入库路径）；缺 `DASHSCOPE_API_KEY` / `EMBEDDING_API_KEY`
+  时返回 503 并给出提示。本地目录建索引用 `ai-agent-py ingest`，写的是同一张表。
 
 ### 命令行用法
 
@@ -545,13 +582,24 @@ Invoke-RestMethod "http://127.0.0.1:8000/api/documents/$($job.id)"
 | `DASHSCOPE_API_KEY` | 空 | 阿里云百炼 Key；`LLM_API_KEY` / `EMBEDDING_API_KEY` 未填时分别作为对话 / 向量密钥 |
 | `EMBEDDING_DIMENSIONS` | 空 | 请求的向量维度（v4 默认 1024；本项目的 Milvus 表是 1536，必须显式指定） |
 | `EMBEDDING_BATCH_SIZE` | `64` | 单次 embedding 文本数；百炼兼容接口建议 `10` |
-| `VECTOR_STORE` | `chroma` | `chroma`（持久化）或 `memory`（进程内，测试用） |
-| `COLLECTION_NAME` / `CHROMA_DIR` | `rag_docs` / `data/chroma` | 集合名与持久化目录 |
 | `DATA_DIR` | `data/raw` | `ingest` 的默认来源目录 |
 | `CHUNK_SIZE` / `CHUNK_OVERLAP` | `800` / `120` | 分块大小与重叠（字符数） |
-| `RETRIEVER_K` | `4` | 召回条数 |
-| `RETRIEVER_SEARCH_TYPE` | `similarity` | `similarity` / `mmr` / `similarity_score_threshold` |
+| `RETRIEVER_K` | `4` | 最终交给模型的片段数（Milvus 先召回 `MILVUS_CANDIDATES` 条再 RRF/精排） |
 | `AGENT_MAX_TURNS` | `8` | 智能体单轮最多工具调用轮数 |
+| `AGENT_MEMORY_CANDIDATES` / `AGENT_MEMORY_SESSIONS` | `200` / `50` | 通用 Agent：从 MySQL 取多少条候选历史（再按 token 预算裁剪）、会话列表默认返回条数 |
+| `AGENT_MODEL_CONTEXT_TOKENS` / `AGENT_CONTEXT_MAX_TOKENS` | `32768` / `0`（自动） | 模型上下文窗口与历史预算上限；实际预算 = 窗口 − 输出预留 − 安全余量 − 系统提示 − 工具 schema |
+| `AGENT_OUTPUT_RESERVE_TOKENS` / `AGENT_CONTEXT_SAFETY_TOKENS` | `2048` / `512` | 为模型输出与估算误差预留的 token |
+| `AGENT_TOKEN_CHARS` | `2.0` | 中文 token 估算密度（字符/token；英文可调到 4） |
+| `AGENT_HISTORY_KEEP_MESSAGES` / `AGENT_MESSAGE_MAX_CHARS` | `8` / `8000` | 优先保留的最近消息数、单条历史消息进入提示词的最大字符数 |
+| `AGENT_TOOL_RESULT_MAX_CHARS` / `AGENT_TOOL_RESULT_HEAD_CHARS` / `AGENT_TOOL_RESULT_TAIL_CHARS` | `8000` / `4096` / `1024` | 单次工具结果回给模型的头/尾预算 |
+| `AGENT_TOOL_TURN_MAX_CHARS` | `20000` | 单轮累计工具输出上限（超出后较早结果换成占位） |
+| `AGENT_SUMMARY_ENABLED` / `AGENT_SUMMARY_TRIGGER_TOKENS` | `true` / `12000` | 是否启用滚动摘要、未压缩历史触发摘要的 token 阈值 |
+| `AGENT_SUMMARY_KEEP_MESSAGES` / `AGENT_SUMMARY_MAX_CHARS` | `8` / `1200` | 摘要后保留的最近消息数、摘要长度上限 |
+| `AGENT_SUMMARY_MAX_TOKENS` / `AGENT_SUMMARY_INPUT_MAX_CHARS` | `1200` / `30000` | 摘要模型输出上限、送进摘要模型的对话文本上限 |
+| `AGENT_CONTEXT_OVERFLOW_RETRIES` | `1` | 上下文超限后的强制压缩重试次数 |
+| `AGENT_WORKSPACE` / `AGENT_SHELL_TIMEOUT` / `AGENT_SHELL_MAX_OUTPUT` | 项目根目录 / `120` / `20000` | 文件工具与 shell 的工作目录边界、命令超时（秒）、单路输出上限（字符） |
+| `WEB_SEARCH_API_KEY` / `WEB_SEARCH_MODEL` / `WEB_SEARCH_STRATEGY` | 空（回退 `DASHSCOPE_API_KEY`） / `qwen-plus` / 空 | 联网搜索 Key、模型与策略（留空 = 服务端默认 turbo） |
+| `WEB_EXTRACTOR_MODEL` / `WEB_EXTRACTOR_MAX_CHARS` | 跟随 `LLM_MODEL` / `20000` | 网页抓取模型与正文上限；Base URL / Key 留空跟随 LLM |
 | `MINERU_API_KEY` | 空 | MinerU Token（[申请](https://mineru.net/apiManage/token)），文档解析必需 |
 | `MINERU_MODEL_VERSION` | `vlm` | `pipeline` / `vlm`（推荐）/ `MinerU-HTML`（仅 HTML） |
 | `MINERU_LANGUAGE` | `ch` | OCR 语言，扫描件/图片务必选对 |
@@ -615,13 +663,13 @@ MINERU_LANGUAGE=ch
 ### 1. RAG 链（`rag/chain.py`）
 
 ```python
-answer = answer_question("问题", llm=llm, retriever=retriever)  # -> RagAnswer(answer, sources)
-chain = build_rag_chain(llm, retriever)  # LCEL: {question} -> {answer, documents}
+answer = answer_question("问题", llm=llm, searcher=searcher)  # -> RagAnswer(answer, sources)
+chain = build_rag_chain(llm, searcher)  # LCEL: {question} -> {answer, documents}
 ```
 
 - 提示词把召回片段编号渲染成 `[1] 来源：xxx`，要求模型只依据资料回答并标注编号。
 - 没有召回结果时**直接返回兜底答案，不调用 LLM**（省钱且避免幻觉）。
-- `format_documents()` 同时被检索工具复用，保证两套路径的引用格式一致。
+- `format_documents()` 同时被检索工具复用，保证所有调用路径的引用格式一致。
 
 ### 2. LangGraph 智能体（`graph/`）
 
@@ -641,30 +689,156 @@ START ──▶ agent ──有 tool_calls？──是──▶ tools
 
 新增工具只需在 `tools/__init__.py` 里加函数，再 `build_agent_graph(tools=[...])`，图本身不用改。
 
-### 3. RAG 问答图（`graph/rag_chat.py` + `rag/milvus_search.py`）
+#### 通用工具（`tools/workspace.py` / `filesystem.py` / `shell.py` / `web_search.py` / `web_extractor.py`）
+
+与业务无关的一组基础工具，可以直接挂给任意 LangGraph 智能体：
+
+| 工具 | 入参 | 行为 |
+| --- | --- | --- |
+| `read` | `path`, `offset=1`, `limit=2000` | 带行号返回文本，支持分页；拒绝二进制与 >20MB 文件 |
+| `write` | `path`, `content` | 创建或整体覆盖（UTF-8、换行原样、自动建父目录） |
+| `edit` | `path`, `old_string`, `new_string`, `replace_all=false` | 精确替换，默认要求唯一匹配；保留原编码与 CRLF |
+| `glob` | `pattern`, `path="."`, `max_results=200` | 文件名任意层级匹配或 `**` 递归，按修改时间倒序 |
+| `grep` | `pattern`, `path="."`, `include=None`, `ignore_case=false`, `max_results=250` | 正则搜索，按文件输出「行号: 内容」 |
+| `shell` | `command`, `timeout=None`, `cwd="."` | 工作目录内执行命令（pwsh / powershell / cmd / bash），返回 stdout、stderr 与退出码 |
+| `web_search` | `query` | 百炼联网搜索（DashScope 原生接口），返回摘要 + `[ref_n]` 来源列表 |
+| `web_extract` | `url` | 百炼 `web_extractor`（Responses API），抓取单页正文并按上限截断 |
+
+```python
+from ai_agent_py.rag.milvus_search import get_milvus_searcher
+from ai_agent_py.tools import (
+    build_knowledge_tool,
+    build_web_extractor_tool,
+    build_web_search_tool,
+    build_workspace_tools,
+)
+
+tools = [
+    build_knowledge_tool(get_milvus_searcher()),
+    *build_workspace_tools(include_shell=False),  # 默认带 shell
+    build_web_search_tool(),
+    build_web_extractor_tool(),
+]
+graph = build_agent_graph(tools=tools)
+```
+
+- 所有路径都由 `workspace.py` 解析：`..`、绝对越界路径、指向外部的符号链接一律拒绝，
+  读写范围仅限 `AGENT_WORKSPACE`（默认项目根目录）；`glob` / `grep` 自动跳过
+  `.git`、`.venv`、`node_modules`、`__pycache__`、各类缓存目录。
+- 读取按行分页，单行超过 2000 字符会截断；`grep` 单文件上限 2MB、结果默认最多 250 行；
+  `shell` 的 stdout / stderr 按头尾截断，超时默认 120 秒。
+- 预期内的失败（文件不存在、正则写错、`old_string` 不唯一）由工具返回 `错误：...`，
+  不会打断图；只有真正的 bug 才落到 `tools` 节点的异常兜底。
+- `web_search` 走 DashScope 原生 `text-generation` 接口（`enable_search` + `enable_source`），
+  所以能同时拿到摘要和来源；OpenAI 兼容接口即使开了搜索也不返回来源，因此没有采用。
+  Key 用 `WEB_SEARCH_API_KEY`，留空回退 `DASHSCOPE_API_KEY`；两者都没有时调用返回配置提示，
+  不影响图构建。`WEB_SEARCH_STRATEGY` 留空用服务端默认（turbo），`forced_search` 默认开启。
+- `web_extract` 走百炼 OpenAI 兼容 Responses API（`tools=[web_search, web_extractor]`，非流式）。
+  `LLM_BASE_URL` 是百炼域名时默认复用它的端点 / Key / 模型，否则退回百炼公网端点 +
+  `WEB_SEARCH_API_KEY`（可用 `WEB_EXTRACTOR_*` 覆盖），因此模型必须是支持 `web_extractor`
+  的百炼模型（Qwen3.5-Plus 及以上 / Qwen3.7、3.8 系列）。抓取内容由模型转述，回填上限
+  `WEB_EXTRACTOR_MAX_CHARS`；响应里没有 `web_extractor_call` 时会明确提示「内容可能不是页面正文」。
+- 工作目录内的文件（包括 `.env`）对模型可读，**敏感信息不要放进 `AGENT_WORKSPACE`**。
+- 这组工具默认不挂到知识库问答图上（那套提示词只认检索工具），需要时按上面的方式显式传入。
+
+### 3. RAG 问答图（`graph/rag_chat.py` + `rag/milvus_search.py` + `rag/doc_names.py`）
 
 ```text
-START ──▶ condense ──▶ retrieve ──▶ answer ──▶ END
-            │            │            │
-         改写追问      rag_chunk     带 [1][2] 引用
-        （首轮跳过）   RRF + 精排    无召回不调 LLM
+START ──▶ condense ──▶ retrieve ──▶ resolve ──▶ answer ──▶ END
+            │            │            │            │
+         改写追问      rag_chunk     MySQL 文件名   带 [1][2] 引用
+        （首轮跳过）   RRF + 精排                 无召回不调 LLM
 ```
 
 - `RagChatState`：`messages`（`add_messages` 追加）+ `query` / `documents` / `answer`
-  （每轮覆盖）；`condense` / `retrieve` / `answer` 三个节点都是普通函数，可单独测试。
+  （每轮覆盖）；`condense` / `retrieve` / `resolve` / `answer` 四个节点都是普通函数，可单独测试。
 - 检索分两段：`MilvusChunkSearcher` 先做稠密 + BM25 + RRF 融合，配了 Key 时再把
   `RERANK_CANDIDATES` 条候选交给 `rag/rerank.py`（`qwen3.7-text-rerank`）精排后取
   `RETRIEVER_K` 条；精排异常被吞掉并退回 RRF 顺序，不影响问答可用性。
-- `build_rag_chat_graph(llm=..., searcher=..., checkpointer=...)` 注入依赖：测试用
-  `ScriptedChatModel` + 假检索器，不联网；生产用 `ChatOpenAI(streaming=True)` +
-  `MilvusChunkSearcher`。
+- `resolve` 由 `rag/doc_names.py` 实现：`MySQLDocumentNameResolver` 按 `doc_id` 批量读
+  `tb_document_parse_job.file_name`，失败降级为 `doc_id`；`apply_document_names` 把结果写回
+  `metadata["source"]` / `metadata["doc_name"]`，提示词和接口引用共用这一份来源。
+- `build_rag_chat_graph(llm=..., searcher=..., resolver=..., checkpointer=...)` 注入依赖：测试用
+  `ScriptedChatModel` + 假检索器 + 假文件名解析器，不联网、不连 MySQL；生产用
+  `ChatOpenAI(streaming=True)` + `MilvusChunkSearcher` + `MySQLDocumentNameResolver`。
 - 答案节点把历史消息（最近 6 条）+ 编号资料 + 本轮问题一起交给模型，所以追问可以引用上文，
   但事实依据仍限定在本次检索结果里。
 - API 层（`api/rag.py`）把 `graph.stream(..., stream_mode=["messages", "updates"])` 翻译成
   SSE：只转发 `answer` 节点里 `AIMessageChunk` 的 token（`condense` 的改写过程不展示，
   非流式模型产出的完整消息也不重复推送，最终以 `done.answer` 为准）。
 
-### 4. 文档解析（`mineru/` + `api/documents.py`）
+### 4. 通用 Agent（`general/agent.py` + `db/agent_chat.py` + `api/general_agent.py`）
+
+「Agent 应用 → 通用 Agent」把项目里的**全部工具**挂到同一张 ReAct 图上，并把多轮上下文
+交给 MySQL，重启服务后会话依旧还在。
+
+```text
+START ──▶ agent ──有 tool_calls？──是──▶ tools ──▶ agent ──…──▶ END
+             │                            │
+        选择工具 / 生成回答           执行工具，结果回填
+```
+
+- **工具全部接入**：`search_knowledge_base`（Milvus `rag_chunk`）、`read` / `write` / `edit` /
+  `glob` / `grep`（工作目录内文件）、`shell`（工作目录内命令）、`web_search` /
+  `web_extract`（百炼联网搜索与网页抓取），共 9 个。新增工具只需在
+  `tools/__init__.py` 里加函数并加进 `build_general_tools`，图与接口都不用改。
+- **会话记忆（MySQL）**：`db/agent_chat.py` 定义 `tb_agent_chat_session`、
+  `tb_agent_chat_message` 与 `tb_agent_chat_summary` 三张表，`ChatMemoryStore` 协议 +
+  `MySQLChatMemoryStore` 实现，测试用 `InMemoryChatMemoryStore`。每轮流程：
+  1. `ensure_session` 创建（或复用）会话；
+  2. 按 token 预算取历史（`general/context.py`：最近连续尾部 + 单条截断）；更早的历史
+     超过阈值时先合并进摘要（`general/summary.py`，见下）；
+  3. 用户消息**先落库**（模型失败也不丢）；
+  4. 跑图；流式时按 `updates` 里的 `AIMessage.tool_calls` / `ToolMessage` 生成
+     `tool_call` / `tool_result` 事件；
+  5. 把工具调用记录与最终回答写回 MySQL，`done` 事件带上落库后的消息与上下文统计。
+- **上下文压缩（L1–L4）**：
+  - **L1 工具输出**：单次结果保留「头 + 标记 + 尾」（`AGENT_TOOL_RESULT_*`），完整结果放
+    `ToolMessage.artifact` 供落库/界面；单轮累计超过 `AGENT_TOOL_TURN_MAX_CHARS` 时，较早的
+    工具结果在 prompt 里换成占位符（保留 tool_call 配对）。
+  - **L2 历史预算**：`历史预算 = 模型窗口 − 输出预留 − 安全余量 − 系统提示 − 工具 schema`
+    （`AGENT_MODEL_CONTEXT_TOKENS` / `AGENT_CONTEXT_MAX_TOKENS`），从最新往前保留连续消息，
+    单条超长消息中间截断；中文默认按 2 字符/token 估算（`AGENT_TOKEN_CHARS`）。
+  - **L3 滚动摘要**：未压缩历史超过 `AGENT_SUMMARY_TRIGGER_TOKENS` 时，把更早部分按固定
+    8 节结构（主要请求 / 关键技术 / 文件与代码 / 错误与修复 / 待办 / 当前工作 / 下一步 /
+    关键上下文）压缩成摘要，存 `tb_agent_chat_summary`；摘要必须比原文小才会替换。
+    原始消息不删除，`GET /sessions/{id}/messages` 返回 `compressed=true` 标记，前端可展开查看。
+  - **L4 溢出重试 / 手动压缩**：provider 报 context length 时自动强制再压缩并重试一次；
+    `POST /api/general-agent/sessions/{id}/compact` 可手动压缩。
+- **SSE 事件**：压缩过历史时先发 `stage: compact`；常规顺序为 `session` →
+  （`tool_call` → `tool_result`）… → `token`… → `done`（完整答案 + 上下文统计 + 落库消息）；
+  `error` 表示失败。没有工具调用时只有 `session` / `token` / `done`。
+- **前端**：`web/src/pages/agent/GeneralAgentPage.tsx` 左侧是 MySQL 会话列表（可切换 / 删除），
+  右侧聊天区把每次工具调用渲染成卡片（可展开看结果），点击示例可直接试用
+  「文件 / 知识库 / 联网」三条路径；页头显示模型、上下文预算、已压缩条数与工具数，
+  可手动「压缩历史」，已压缩消息默认折叠、可展开查看。
+- **失败处理**：没配对话模型 Key → `/overview` 给出提示、对话接口 503；MySQL 未配置 / 未建表 →
+  记忆状态标记不可用并提示执行建表脚本（`docs/mysql/` 下三个 SQL），不会静默假装记得。
+- **与 RAG 问答的记忆区别**：RAG 问答用 `InMemorySaver`（进程内、重启即失效）；通用 Agent
+  的会话记忆在 MySQL，可跨进程 / 跨重启，并在左侧列出历史会话。
+
+```powershell
+# 建表（首次使用通用 Agent 前执行一次）
+Get-Content docs/mysql/tb_agent_chat_session.sql | mysql -u admin -p db_py_agent
+Get-Content docs/mysql/tb_agent_chat_message.sql | mysql -u admin -p db_py_agent
+Get-Content docs/mysql/tb_agent_chat_summary.sql | mysql -u admin -p db_py_agent
+
+# 同步调用（脚本 / 联调）
+Invoke-RestMethod -Uri http://127.0.0.1:8000/api/general-agent/chat -Method Post `
+  -ContentType 'application/json' `
+  -Body '{"message":"列出项目里的 Python 文件","thread_id":"demo-general"}'
+
+# 手动压缩历史（保留最近 8 条，其余合并进摘要）
+Invoke-RestMethod -Uri http://127.0.0.1:8000/api/general-agent/sessions/demo-general/compact `
+  -Method Post -ContentType 'application/json' -Body '{"keep":8}'
+
+# 流式（SSE）：工具调用与回答逐条推送，命令行可用 curl -N
+curl.exe -N -X POST http://127.0.0.1:8000/api/general-agent/chat/stream `
+  -H "Content-Type: application/json" `
+  -d '{"message":"在知识库里查一下业务招待费的扣除标准","thread_id":"demo-general"}'
+```
+
+### 5. 文档解析（`mineru/` + `api/documents.py`）
 
 | 文件 | 职责 |
 | --- | --- |
@@ -695,10 +869,11 @@ Get-Content docs/mysql/tb_document_parse_job.sql | mysql -u admin -p db_py_agent
 ```
 
 - 表名 `tb_document_parse_job`，一行一个解析任务；`id` 同时是 `data/parsed/<id>/` 的目录名。
-- 原 JSON 里嵌套的 `options`（模型版本 / OCR 语言 / 公式表格开关 / 页码范围）与
-  `ingest`（入库摘要）摊平成 `model_version`、`language`、`enable_formula`… 与 `ingest_*` 列，
-  可以直接按列筛选统计，不用解析 JSON。RAG（Milvus）入库另记在 `rag_ingest_*` /
-  `rag_ingested_at`：非 NULL 即列表里的「已入库」，与 Chroma 的 `ingest_*` 互不覆盖。
+- 原 JSON 里嵌套的 `options`（模型版本 / OCR 语言 / 公式表格开关 / 页码范围）摊平成
+  `model_version`、`language`、`enable_formula`… 列，可以直接按列筛选统计，不用解析 JSON。
+  RAG（Milvus）入库摘要记在 `rag_ingest_*` / `rag_ingested_at`：非 NULL 即列表里的「已入库」。
+- 历史版本里的 `ingest_*` 列属于已移除的 Chroma 链路，新版建表脚本不再包含；
+  已按旧版建过表的库可以保留这些列（可空、不再读写），也可以手工 `ALTER TABLE ... DROP COLUMN`。
 - 建表脚本已包含 `rag_*` 四列；已按旧版建过表的库，需要自行补齐这四列。
 - 时间列一律存 **UTC**（`DATETIME(6)`），接口输出仍带 `Z`；要展示东八区时间用
   `CONVERT_TZ(created_at, '+00:00', '+08:00')`。
@@ -714,9 +889,9 @@ uv run ai-agent-py db import-jobs             # 写入 tb_document_parse_job
 | 想做的事 | 改哪里 |
 | --- | --- |
 | 接入新模型厂商 | `.env` 里的 `*_BASE_URL` / `*_MODEL` |
-| 换向量库（FAISS、pgvector…） | `rag/store.py::build_vector_store` 加分支 |
+| 换向量库（FAISS、pgvector…） | 实现 `rag/milvus_search.py::DocumentSearcher.search` 协议，再在 `get_milvus_searcher` 旁加一个工厂；调用方（`/query`、智能体工具、RAG 问答）不用改 |
 | 支持新文件类型（HTML、Excel…） | `rag/loaders.py::load_file` 加分支 |
-| 加召回后重排（rerank） | `rag/rerank.py`（已内置 `qwen3.7-text-rerank`）；Chroma 链路可再包一层 `DocumentCompressor` |
+| 加召回后重排（rerank） | `rag/rerank.py`（已内置 `qwen3.7-text-rerank`），实现 `Reranker.rerank` 即可替换 |
 | 调 RAG 问答检索策略 | `rag/milvus_search.py`（两路候选数 `MILVUS_CANDIDATES`、`RRFRanker(MILVUS_RRF_K)`、精排候选 `RERANK_CANDIDATES`、缺 Key 退 BM25） |
 | RAG 记录加筛选维度 | `rag/records.py::build_filter` + `rag/models.py::RagChunkListOut` + 前端筛选栏 |
 | 解析更多文件类型 | `mineru/service.py::ALLOWED_SUFFIXES` + `.env` 里的 `MINERU_MAX_FILE_MB` |
@@ -726,7 +901,7 @@ uv run ai-agent-py db import-jobs             # 写入 tb_document_parse_job
 ## 开发
 
 ```powershell
-uv run pytest            # 216 个测试，全部离线（MinerU / 精排用 httpx.MockTransport，任务记录库用内存 JobStore，RAG 记录 / 问答用假 Milvus 客户端与脚本化模型）
+uv run pytest            # 318 个测试，全部离线（MinerU / 精排用 httpx.MockTransport，任务记录库用内存 JobStore，RAG 记录 / 问答用假 Milvus 客户端与脚本化模型；检索链路用 offline.OfflineChunkSearcher）
 uv run ruff check .      # 静态检查
 uv run ruff format .     # 格式化
 uv run mypy              # 类型检查（src 目录）
@@ -748,7 +923,8 @@ pnpm build               # 产物 web/dist，由 FastAPI 托管
   用 `httpx.MockTransport` 模拟 MinerU 全流程（上传 / 轮询 / 下载 zip）；
   `tests/test_database.py` 用假引擎覆盖成功与密码错误两条路径，不会连本机 MySQL；
   `tests/test_rag_records.py` / `tests/test_milvus_search.py` / `tests/test_rag_chat_graph.py` /
-  `tests/test_rag_api.py` 用假 Milvus 客户端与脚本化模型覆盖 RAG 记录与问答，不连 Milvus。
+  `tests/test_rag_api.py` / `tests/test_doc_names.py` 用假 Milvus 客户端、假文件名存储与
+  脚本化模型覆盖 RAG 记录与问答，不连 Milvus / MySQL。
 
 ## 常见问题
 
@@ -764,7 +940,8 @@ uv sync
 ```
 
 **换了 embedding 模型后检索结果很差？**
-向量维度与语义空间都变了，必须重建索引：`uv run ai-agent-py ingest --recreate`。
+向量维度与语义空间都变了，必须换新集合再重新入库：`uv run ai-agent-py ingest`（按源文件覆盖写；
+换维度要先用 `docs/milvus/create_rag_chunk.py --dim 新维度 --recreate` 建新集合）。
 
 **PDF 检索不到内容？**
 扫描版 PDF 没有文本层，需要先 OCR。加载器遇到无文本页面会打印警告并跳过。
@@ -773,8 +950,8 @@ uv sync
 对话可以，但它不提供 embedding 接口，向量模型要单独配置（硅基流动 / OpenAI / Ollama 等）。
 
 **数据放在哪里？**
-默认 `data/raw/`，支持子目录递归；也可以 `uv run ai-agent-py ingest D:\docs --recreate` 指定任意目录。
-`data/raw/` 与 `data/chroma/` 已在 `.gitignore` 中忽略。
+默认 `data/raw/`，支持子目录递归；也可以 `uv run ai-agent-py ingest D:\docs` 指定任意目录。
+`data/raw/` 与 `data/parsed/` 已在 `.gitignore` 中忽略。
 
 **文档解析提示「Token 无效 / 未配置」？**
 在 `.env` 里填 `MINERU_API_KEY` 后重启服务；页面顶部有黄色提示说明未配置。
@@ -813,6 +990,19 @@ uv sync
 LangGraph 的 `InMemorySaver`，按前端生成的 `thread_id` 存在**服务端进程内**。刷新页面或点
 「新会话」会换一个新的 `thread_id`；服务重启后旧会话失效（不会报错，只是从头开始）。
 多实例部署时请用粘性会话，或把 checkpointer 换成持久化实现（如 Postgres / Redis）。
+
+**通用 Agent 的会话记忆存在哪里？**
+MySQL：`tb_agent_chat_session`（会话）、`tb_agent_chat_message`（消息，含工具调用记录）与
+`tb_agent_chat_summary`（滚动摘要）。每轮先按 token 预算挑选历史（最近连续尾部），
+更早的历史超过阈值时压缩成摘要，原始消息不删除，界面可标记/展开已压缩消息。
+首次使用前执行 `docs/mysql/` 下三个建表脚本；缺表时页面会提示对应脚本，不会静默丢历史。
+
+**通用 Agent 的上下文压缩参数怎么调？**
+主要是 `AGENT_MODEL_CONTEXT_TOKENS`（按实际模型窗口）、`AGENT_SUMMARY_TRIGGER_TOKENS`
+（越小越早摘要）、`AGENT_HISTORY_KEEP_MESSAGES`（保留最近几轮原文）与
+`AGENT_TOOL_RESULT_MAX_CHARS` / `AGENT_TOOL_TURN_MAX_CHARS`（工具输出预算）。
+中文估算按 `AGENT_TOKEN_CHARS=2.0`；如果用的模型 tokenizer 更"费"，再调小。
+摘要失败时会自动降级为窗口截断，不影响对话。
 
 **亮色 / 暗色主题怎么切换？**
 页面右上角的月亮 / 太阳按钮，选择保存在浏览器 `localStorage`，刷新或重启服务都保持；

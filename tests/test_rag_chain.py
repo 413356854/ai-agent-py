@@ -14,25 +14,21 @@ from ai_agent_py.rag.chain import (
     normalize_citations,
 )
 from ai_agent_py.rag.ingest import ingest
-from ai_agent_py.rag.retriever import get_retriever
-from ai_agent_py.rag.store import store_size
 from fakes import ScriptedChatModel
 
 
-def test_ingest_then_answer(settings, store, embeddings, corpus_dir) -> None:
-    report = ingest(
-        [corpus_dir], store=store, embeddings=embeddings, settings=settings, recreate=True
-    )
+def test_ingest_then_answer(settings, searcher, corpus_dir) -> None:
+    report = ingest([corpus_dir], writer=searcher, settings=settings)
 
     assert report.files == 3
     assert report.chunks >= 3
     assert report.characters > 0
-    assert store_size(store) == report.chunks
+    assert report.store == "OfflineChunkSearcher"
+    assert len(searcher) == report.chunks
 
-    retriever = get_retriever(store=store, settings=settings, k=3)
     llm = ScriptedChatModel(responses=[AIMessage(content="本项目用 uv 管理依赖。")])
 
-    result = answer_question("这个项目用什么管理依赖？", llm=llm, retriever=retriever)
+    result = answer_question("这个项目用什么管理依赖？", llm=llm, searcher=searcher, k=3)
 
     assert result.answer == "本项目用 uv 管理依赖。"
     assert result.documents
@@ -43,37 +39,33 @@ def test_ingest_then_answer(settings, store, embeddings, corpus_dir) -> None:
     assert "uv" in prompt
 
 
-def test_lcel_chain_returns_answer_and_documents(settings, store, embeddings, corpus_dir) -> None:
-    ingest([corpus_dir], store=store, embeddings=embeddings, settings=settings, recreate=True)
-    retriever = get_retriever(store=store, settings=settings, k=2)
+def test_lcel_chain_returns_answer_and_documents(settings, searcher, corpus_dir) -> None:
+    ingest([corpus_dir], writer=searcher, settings=settings)
     llm = ScriptedChatModel(responses=[AIMessage(content="来自 LCEL 链的回答")])
 
-    output = build_rag_chain(llm, retriever).invoke({"question": "LangGraph 用来做什么？"})
+    output = build_rag_chain(llm, searcher).invoke({"question": "LangGraph 用来做什么？"})
 
     assert output["answer"] == "来自 LCEL 链的回答"
     assert output["documents"]
     assert "来源" in output["context"]
 
 
-def test_answer_without_documents_skips_the_llm(settings, store) -> None:
-    retriever = get_retriever(store=store, settings=settings)
+def test_answer_without_documents_skips_the_llm(settings, searcher) -> None:
     llm = ScriptedChatModel(responses=[AIMessage(content="不应被调用")])
 
-    result = answer_question("知识库里没有的问题", llm=llm, retriever=retriever)
+    result = answer_question("知识库里没有的问题", llm=llm, searcher=searcher)
 
     assert result.answer == NO_CONTEXT_ANSWER
     assert result.sources == []
     assert llm.calls == 0
 
 
-def test_reingest_is_idempotent(settings, store, embeddings, corpus_dir) -> None:
-    first = ingest(
-        [corpus_dir], store=store, embeddings=embeddings, settings=settings, recreate=True
-    )
-    second = ingest([corpus_dir], store=store, embeddings=embeddings, settings=settings)
+def test_reingest_is_idempotent(settings, searcher, corpus_dir) -> None:
+    first = ingest([corpus_dir], writer=searcher, settings=settings)
+    second = ingest([corpus_dir], writer=searcher, settings=settings)
 
     assert second.chunks == first.chunks
-    assert store_size(store) == first.chunks
+    assert len(searcher) == first.chunks
 
 
 def test_format_documents_numbers_sources_and_pages() -> None:

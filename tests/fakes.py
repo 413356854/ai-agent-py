@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
 from langchain_core.callbacks import CallbackManagerForLLMRun
@@ -38,6 +38,18 @@ class InMemoryJobStore:
 
     def __len__(self) -> int:
         return len(self._jobs)
+
+
+class FakeDocumentNameResolver:
+    """`DocumentNameResolver` 的内存实现：记录每次查询，便于断言去重与降级。"""
+
+    def __init__(self, names: Mapping[str, str] | None = None) -> None:
+        self.names = dict(names or {})
+        self.calls: list[list[str]] = []
+
+    def resolve(self, doc_ids: Sequence[str]) -> dict[str, str]:
+        self.calls.append(list(doc_ids))
+        return {doc_id: self.names[doc_id] for doc_id in doc_ids if doc_id in self.names}
 
 
 def tool_call(name: str, query: str, *, call_id: str = "call-1") -> AIMessage:

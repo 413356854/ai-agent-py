@@ -20,8 +20,6 @@ if TYPE_CHECKING:
 
 PROJECT_ROOT = Path(os.getenv("AI_AGENT_PY_ROOT", Path(__file__).resolve().parents[2])).resolve()
 
-SearchType = Literal["similarity", "mmr", "similarity_score_threshold"]
-VectorStoreKind = Literal["chroma", "memory"]
 MineruModelVersion = Literal["pipeline", "vlm", "MinerU-HTML"]
 
 
@@ -55,6 +53,74 @@ class Settings(BaseSettings):
     llm_timeout: float = 60.0
     agent_max_turns: int = 8
 
+    # ---- 通用 agent 工具（read / write / edit / glob / grep / shell）----
+    # 文件工具只能读写这个目录内的路径，shell 的 cwd 也限制在这里。
+    agent_workspace: Path = PROJECT_ROOT
+    # shell 命令默认超时（秒），单次调用可用 timeout 参数覆盖。
+    agent_shell_timeout: float = 120.0
+    # shell 的 stdout / stderr 各自保留的最大字符数，超出按头尾截断。
+    agent_shell_max_output: int = 20000
+
+    # ---- 通用 agent 的会话记忆（MySQL tb_agent_chat_session / tb_agent_chat_message）----
+    # 会话列表默认返回条数；历史候选池见下方 AGENT_MEMORY_CANDIDATES。
+    agent_memory_sessions: int = 50
+
+    # ---- 通用 agent 上下文压缩（L1 工具预算 / L2 历史预算 / L3 摘要）----------
+    # 模型上下文窗口与输出预留：历史预算 = 窗口 - 输出预留 - 安全余量 - 系统提示 - 工具 schema；
+    # AGENT_CONTEXT_MAX_TOKENS > 0 时再取两者较小值。
+    agent_model_context_tokens: int = 32768
+    agent_context_max_tokens: int = 0
+    agent_output_reserve_tokens: int = 2048
+    agent_context_safety_tokens: int = 512
+    # 中文按「字符 / token」估算的密度；越小越保守（默认 2.0，英文可用 4.0）。
+    agent_token_chars: float = 2.0
+    # 从 MySQL 读取的候选历史条数（再按 token 预算裁剪）。
+    agent_memory_candidates: int = 200
+    # 最近多少条消息优先保留原文（预算极紧时仍可能被裁剪）。
+    agent_history_keep_messages: int = 8
+    # 单条历史消息进入提示词的最大字符数（中间截断）。
+    agent_message_max_chars: int = 8000
+    # 工具输出：单次回给模型的上限（保留头 + 尾，中间省略）；单轮累计上限。
+    agent_tool_result_max_chars: int = 8000
+    agent_tool_result_head_chars: int = 4096
+    agent_tool_result_tail_chars: int = 1024
+    agent_tool_turn_max_chars: int = 20000
+    # 滚动摘要：未压缩历史超过 trigger 时，把更早部分合并成摘要。
+    agent_summary_enabled: bool = True
+    agent_summary_trigger_tokens: int = 12000
+    agent_summary_keep_messages: int = 8
+    agent_summary_max_chars: int = 1200
+    agent_summary_max_tokens: int = 1200
+    agent_summary_input_max_chars: int = 30000
+    # 上下文溢出（provider 返回 context length 错误）后的强制压缩重试次数。
+    agent_context_overflow_retries: int = 1
+
+    # ---- 联网搜索（阿里云百炼 Web Search，DashScope 原生接口）------------
+    # 文档：https://help.aliyun.com/zh/model-studio/web-search
+    # Key 留空时回退 DASHSCOPE_API_KEY；两者都没有时工具调用返回配置提示。
+    # 走原生接口是因为 OpenAI 兼容接口开了搜索也拿不到来源列表。
+    web_search_api_key: SecretStr | None = None
+    web_search_base_url: str = "https://dashscope.aliyuncs.com/api/v1"
+    web_search_model: str = "qwen-plus"
+    # 搜索量级策略；留空用服务端默认（turbo）。可选 turbo / max / agent / agent_max。
+    web_search_strategy: str | None = None
+    # 强制搜索：不让模型因为「觉得自己知道」而跳过联网。
+    web_search_forced: bool = True
+    web_search_enable_citation: bool = True
+    web_search_timeout: float = 30.0
+
+    # ---- 网页抓取（阿里云百炼 Web Extractor，OpenAI 兼容 Responses API）--
+    # 文档：https://help.aliyun.com/zh/model-studio/web-extractor
+    # 原生 Chat Completions 只支持流式；Responses API 非流式即可返回 output
+    # 列表（web_extractor_call + 最终正文）。LLM_BASE_URL 是百炼域名时默认复用
+    # 它的端点 / Key / 模型，否则退回百炼公网端点 + 联网搜索 Key。
+    web_extractor_base_url: str | None = None
+    web_extractor_api_key: SecretStr | None = None
+    web_extractor_model: str | None = None
+    web_extractor_timeout: float = 120.0
+    # 回填给模型的正文上限（字符），避免整页内容塞爆上下文。
+    web_extractor_max_chars: int = 20000
+
     # ---- embeddings ----------------------------------------------------
     # 阿里云百炼（DashScope）OpenAI 兼容模式：text-embedding-v4，默认 1024 维，
     # 可通过 EMBEDDING_DIMENSIONS 指定 1536/1024/768...，必须与 MILVUS_DIM 一致。
@@ -67,14 +133,8 @@ class Settings(BaseSettings):
     # `None` -> auto: only OpenAI hosts get tiktoken based chunking.
     embedding_check_ctx_length: bool | None = None
 
-    # ---- vector store --------------------------------------------------
-    vector_store: VectorStoreKind = "chroma"
-    collection_name: str = "rag_docs"
-    chroma_dir: Path = PROJECT_ROOT / "data" / "chroma"
-
-    # ---- Milvus（通用业务 RAG 表，建表脚本 docs/milvus/create_rag_chunk.py）----
-    # 与上面的 `vector_store` 并行：chroma 走 LangChain VectorStore，Milvus 存检索块。
-    # 这里放连接、维度与检索参数，写入/混合检索在应用侧按这张表实现。
+    # ---- Milvus（唯一向量库：通用业务 RAG 表，建表脚本 docs/milvus/create_rag_chunk.py）----
+    # 写入在 `rag.milvus`，混合检索在 `rag.milvus_search`；建表后由 Milvus 保存向量与正文。
     milvus_uri: str = "http://localhost:19530"
     milvus_token: SecretStr | None = None
     milvus_database: str = "db_tax_rag"
@@ -116,10 +176,8 @@ class Settings(BaseSettings):
     chunk_overlap: int = 120
 
     # ---- retrieval -----------------------------------------------------
+    # 最终交给模型的片段数（Milvus 侧先召回 MILVUS_CANDIDATES 条再 RRF/精排）。
     retriever_k: int = 4
-    retriever_search_type: SearchType = "similarity"
-    retriever_fetch_k: int = 20
-    retriever_score_threshold: float = 0.2
 
     # ---- MinerU 精准解析 API -------------------------------------------
     # 文档地址：https://mineru.net/apiManage/docs
@@ -236,6 +294,48 @@ class Settings(BaseSettings):
         """Milvus / Zilliz Cloud 的 API Key 或 `user:password` 形式 token。"""
         return self.milvus_token.get_secret_value() if self.milvus_token else None
 
+    @property
+    def resolved_web_search_api_key(self) -> str | None:
+        """联网搜索 Key：``WEB_SEARCH_API_KEY`` → ``DASHSCOPE_API_KEY``。
+
+        联网搜索走 DashScope 原生接口，不跟着 ``LLM_API_KEY`` 走：对话模型可能
+        接的是 DeepSeek / 自建 vLLM，把那个 Key 发到阿里云只会得到 401。
+        """
+        if self.web_search_api_key is not None:
+            return self.web_search_api_key.get_secret_value()
+        if self.dashscope_api_key is not None:
+            return self.dashscope_api_key.get_secret_value()
+        return None
+
+    @property
+    def resolved_web_extractor_base_url(self) -> str:
+        """网页抓取端点：显式覆盖 → 百炼 MaaS 端点 → 百炼公网。
+
+        对话模型不是百炼（比如 DeepSeek / 自建 vLLM）时不能复用它的 Base URL：
+        ``/responses`` 与 web_extractor 只有百炼兼容端点才有，所以退回公网端点，
+        Key 也随之回退到 ``WEB_SEARCH_API_KEY`` / ``DASHSCOPE_API_KEY``。
+        """
+        if self.web_extractor_base_url:
+            return self.web_extractor_base_url
+        host = urlsplit(self.llm_base_url or "").hostname or ""
+        if self.llm_base_url and (host.endswith("aliyuncs.com") or host.endswith("qianwenai.com")):
+            return self.llm_base_url
+        return "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+    @property
+    def resolved_web_extractor_api_key(self) -> str | None:
+        """抓取 Key：显式覆盖 → 百炼对话模型 Key → 联网搜索 Key。"""
+        if self.web_extractor_api_key is not None:
+            return self.web_extractor_api_key.get_secret_value()
+        if self.llm_base_url and self.resolved_web_extractor_base_url == self.llm_base_url:
+            return self.resolved_llm_api_key
+        return self.resolved_web_search_api_key
+
+    @property
+    def resolved_web_extractor_model(self) -> str:
+        """抓取模型：显式覆盖 → 对话模型（必须支持 web_extractor）。"""
+        return self.web_extractor_model or self.llm_model
+
     def describe(self) -> dict[str, Any]:
         """Human readable snapshot with secrets masked (used by `info`)."""
         target = self.mysql_target
@@ -251,18 +351,43 @@ class Settings(BaseSettings):
             "embeddings": f"{self.embedding_model} @ {self.embedding_base_url or 'api.openai.com'}",
             "embedding_api_key": _mask(self.resolved_embedding_api_key),
             "embedding_dimensions": self.embedding_dimensions or "auto",
-            "vector_store": f"{self.vector_store} / {self.collection_name}",
-            "chroma_dir": str(self.chroma_dir),
             "milvus": (
                 f"{self.milvus_uri} / {self.milvus_database}.{self.milvus_collection} "
                 f"(dim={self.milvus_dim}, {self.milvus_metric}, {self.milvus_analyzer})"
             ),
             "milvus_token": "set" if self.milvus_token else "missing",
             "data_dir": str(self.data_dir),
+            "agent_workspace": str(self.agent_workspace),
+            "agent_shell": (
+                f"timeout={self.agent_shell_timeout:g}s, max_output={self.agent_shell_max_output}"
+            ),
+            "agent_memory": (
+                f"mysql, candidates={self.agent_memory_candidates}, "
+                f"sessions={self.agent_memory_sessions}"
+            ),
+            "agent_context": (
+                f"model={self.agent_model_context_tokens}, "
+                f"budget={self.agent_context_max_tokens or 'auto'}, "
+                f"reserve={self.agent_output_reserve_tokens}, "
+                f"chars/token={self.agent_token_chars:g}, "
+                f"tool={self.agent_tool_result_max_chars}/{self.agent_tool_turn_max_chars}, "
+                f"summary={'on' if self.agent_summary_enabled else 'off'} "
+                f"(trigger={self.agent_summary_trigger_tokens})"
+            ),
+            "web_search": (
+                f"{self.web_search_model} @ {self.web_search_base_url} "
+                f"({'on' if self.resolved_web_search_api_key else 'off'})"
+            ),
+            "web_search_api_key": _mask(self.resolved_web_search_api_key),
+            "web_extractor": (
+                f"{self.resolved_web_extractor_model} @ "
+                f"{self.resolved_web_extractor_base_url} "
+                f"({'on' if self.resolved_web_extractor_api_key else 'off'})"
+            ),
             "chunking": f"size={self.chunk_size}, overlap={self.chunk_overlap}",
             "retrieval": (
-                f"{self.retriever_search_type}, k={self.retriever_k}, "
-                f"score_threshold={self.retriever_score_threshold}"
+                f"hybrid(dense+bm25) + RRF, k={self.retriever_k}, "
+                f"candidates={self.milvus_candidates}"
             ),
             "rerank": (
                 f"{self.rerank_model}, candidates={self.rerank_candidates}, "
@@ -292,6 +417,11 @@ class Settings(BaseSettings):
         "rerank_api_key",
         "rerank_endpoint",
         "rerank_instruct",
+        "web_search_api_key",
+        "web_search_strategy",
+        "web_extractor_base_url",
+        "web_extractor_api_key",
+        "web_extractor_model",
         mode="before",
     )
     @classmethod
@@ -300,7 +430,7 @@ class Settings(BaseSettings):
             return None
         return value
 
-    @field_validator("chroma_dir", "data_dir", "mineru_output_dir", mode="after")
+    @field_validator("data_dir", "mineru_output_dir", "agent_workspace", mode="after")
     @classmethod
     def _absolute_path(cls, value: Path) -> Path:
         return value if value.is_absolute() else (PROJECT_ROOT / value)
@@ -327,6 +457,18 @@ class Settings(BaseSettings):
     @field_validator("embedding_base_url", mode="after")
     @classmethod
     def _strip_embedding_base_url(cls, value: str | None) -> str | None:
+        return value.rstrip("/") if value else None
+
+    @field_validator("web_search_base_url", mode="after")
+    @classmethod
+    def _strip_web_search_base_url(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("WEB_SEARCH_BASE_URL 不能为空")
+        return value.rstrip("/")
+
+    @field_validator("web_extractor_base_url", mode="after")
+    @classmethod
+    def _strip_web_extractor_base_url(cls, value: str | None) -> str | None:
         return value.rstrip("/") if value else None
 
     @field_validator("embedding_dimensions", mode="after")
@@ -357,6 +499,98 @@ class Settings(BaseSettings):
     def _positive_rerank_timeout(cls, value: float) -> float:
         if value <= 0:
             raise ValueError("RERANK_TIMEOUT 必须是正数")
+        return value
+
+    @field_validator("agent_shell_timeout", mode="after")
+    @classmethod
+    def _positive_shell_timeout(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("AGENT_SHELL_TIMEOUT 必须是正数")
+        return value
+
+    @field_validator("agent_shell_max_output", mode="after")
+    @classmethod
+    def _positive_shell_output(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("AGENT_SHELL_MAX_OUTPUT 必须是正整数")
+        return value
+
+    @field_validator("agent_memory_sessions", mode="after")
+    @classmethod
+    def _positive_agent_memory(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("AGENT_MEMORY_SESSIONS 必须是正整数")
+        return value
+
+    @field_validator(
+        "agent_model_context_tokens",
+        "agent_output_reserve_tokens",
+        "agent_context_safety_tokens",
+        "agent_memory_candidates",
+        "agent_history_keep_messages",
+        "agent_message_max_chars",
+        "agent_tool_result_max_chars",
+        "agent_tool_result_head_chars",
+        "agent_tool_result_tail_chars",
+        "agent_tool_turn_max_chars",
+        "agent_summary_trigger_tokens",
+        "agent_summary_keep_messages",
+        "agent_summary_max_chars",
+        "agent_summary_max_tokens",
+        "agent_summary_input_max_chars",
+        mode="after",
+    )
+    @classmethod
+    def _positive_agent_context(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("通用 Agent 的上下文预算配置必须是正整数")
+        return value
+
+    @field_validator("agent_context_max_tokens", "agent_context_overflow_retries", mode="after")
+    @classmethod
+    def _non_negative_agent_context(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("AGENT_CONTEXT_MAX_TOKENS / AGENT_CONTEXT_OVERFLOW_RETRIES 不能为负数")
+        return value
+
+    @field_validator("agent_token_chars", mode="after")
+    @classmethod
+    def _positive_token_chars(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("AGENT_TOKEN_CHARS 必须是正数")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_tool_result_budget(self) -> Settings:
+        if (
+            self.agent_tool_result_head_chars + self.agent_tool_result_tail_chars
+            >= self.agent_tool_result_max_chars
+        ):
+            raise ValueError(
+                "AGENT_TOOL_RESULT_HEAD_CHARS + AGENT_TOOL_RESULT_TAIL_CHARS "
+                "必须小于 AGENT_TOOL_RESULT_MAX_CHARS"
+            )
+        return self
+
+    @field_validator("web_search_timeout", mode="after")
+    @classmethod
+    def _positive_web_search_timeout(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("WEB_SEARCH_TIMEOUT 必须是正数")
+        return value
+
+    @field_validator("web_extractor_timeout", mode="after")
+    @classmethod
+    def _positive_web_extractor_timeout(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("WEB_EXTRACTOR_TIMEOUT 必须是正数")
+        return value
+
+    @field_validator("web_extractor_max_chars", mode="after")
+    @classmethod
+    def _positive_web_extractor_chars(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("WEB_EXTRACTOR_MAX_CHARS 必须是正整数")
         return value
 
     @field_validator("rerank_min_score", mode="after")

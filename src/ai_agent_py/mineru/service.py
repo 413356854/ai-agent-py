@@ -37,8 +37,6 @@ from ai_agent_py.mineru.archive import extract_result_zip
 from ai_agent_py.mineru.client import MineruClient
 from ai_agent_py.mineru.models import (
     BatchItem,
-    IngestInfo,
-    IngestResultOut,
     JobState,
     MarkdownOut,
     ParseJob,
@@ -411,40 +409,6 @@ class DocumentService:
             self.job_dir(job.id) / job.markdown_file,
             f"{Path(job.file_name).stem}.md",
         )
-
-    # ---- 写入向量库 ----------------------------------------------------
-    async def ingest(self, job_id: str) -> IngestResultOut:
-        """把解析出的 Markdown 切块写入 RAG 向量库。"""
-        job = await self._require_job(job_id)
-        if job.state is not JobState.done or not job.markdown_file:
-            raise MineruError("文档还没有解析完成，暂时不能入库")
-        path = self.job_dir(job.id) / job.markdown_file
-        report = await asyncio.to_thread(self._ingest_sync, path)
-        job.ingest = IngestInfo(
-            chunks=report.chunks,
-            characters=report.characters,
-            collection=report.collection,
-            store=report.store,
-            source=str(path),
-        )
-        await self._touch(job)
-        logger.info("任务 %s 入库完成: %d chunks", job.id, report.chunks)
-        return IngestResultOut(
-            job_id=job.id,
-            chunks=report.chunks,
-            characters=report.characters,
-            collection=report.collection,
-            store=report.store,
-            source=str(path),
-        )
-
-    def _ingest_sync(self, path: Path) -> Any:
-        # 延迟导入：只有真正入库时才需要 langchain / embedding 依赖
-        from ai_agent_py.rag.ingest import ingest as run_ingest
-        from ai_agent_py.rag.store import build_vector_store
-
-        store = build_vector_store(settings=self.settings)
-        return run_ingest([path], store=store, settings=self.settings)
 
     # ---- 切分预览 / 写入 Milvus RAG 表 ---------------------------------
     async def split_preview(

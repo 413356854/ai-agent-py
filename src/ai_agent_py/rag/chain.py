@@ -9,14 +9,16 @@ from __future__ import annotations
 import re
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from langchain_core.documents import Document
 from langchain_core.language_models import BaseChatModel
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.retrievers import BaseRetriever
 from langchain_core.runnables import Runnable, RunnablePassthrough
+
+if TYPE_CHECKING:
+    from ai_agent_py.rag.milvus_search import DocumentSearcher
 
 NO_CONTEXT_ANSWER = (
     "知识库中没有检索到与这个问题相关的内容。\n"
@@ -201,10 +203,11 @@ def answer_question(
     question: str,
     *,
     llm: BaseChatModel,
-    retriever: BaseRetriever,
+    searcher: DocumentSearcher,
+    k: int | None = None,
 ) -> RagAnswer:
     """Retrieve, then answer. Skips the LLM entirely when nothing was found."""
-    documents = list(retriever.invoke(question))
+    documents = list(searcher.search(question, k=k))
     if not documents:
         return RagAnswer(answer=NO_CONTEXT_ANSWER, documents=[])
     answer, _ = normalize_citations(generate_answer(llm, question, documents), documents)
@@ -213,7 +216,7 @@ def answer_question(
 
 def build_rag_chain(
     llm: BaseChatModel,
-    retriever: BaseRetriever,
+    searcher: DocumentSearcher,
 ) -> Runnable[dict[str, Any], dict[str, Any]]:
     """Composable LCEL equivalent: ``{"question": str} -> {answer, documents, ...}``.
 
@@ -221,7 +224,7 @@ def build_rag_chain(
     """
 
     def _retrieve(payload: dict[str, Any]) -> list[Document]:
-        return list(retriever.invoke(payload["question"]))
+        return list(searcher.search(payload["question"]))
 
     def _format(payload: dict[str, Any]) -> str:
         return format_documents(payload["documents"])

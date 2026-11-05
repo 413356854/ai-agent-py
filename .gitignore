@@ -20,7 +20,6 @@ htmlcov/
 !.env.example
 
 # ---- data -----------------------------------------------------------------
-data/chroma/
 data/parsed/
 data/raw/*
 !data/raw/.gitkeep

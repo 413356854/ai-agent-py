@@ -840,3 +840,237 @@ body {
   white-space: pre-wrap;
   word-break: break-all;
 }
+
+/* ---- 通用 Agent：会话列表 + 工具调用卡片 ------------------------------- */
+.agent-chat-layout {
+  display: grid;
+  grid-template-columns: 264px minmax(0, 1fr);
+  gap: 16px;
+  align-items: stretch;
+}
+
+.agent-sessions {
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - 320px);
+  min-height: 480px;
+  overflow: hidden;
+  border: 1px solid var(--panel-border);
+  border-radius: 12px;
+  background: var(--panel-bg);
+  box-shadow: var(--panel-shadow);
+}
+
+/* 本页顶部比 RAG 问答多一行提示（模型 / 记忆 / 联网 Key），面板高度相应收一点。 */
+.agent-chat-layout .chat-panel {
+  height: calc(100vh - 320px);
+  min-height: 480px;
+}
+
+.agent-sessions-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 12px 10px;
+  border-bottom: 1px solid var(--panel-border);
+  font-size: 14px;
+}
+
+.agent-sessions-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.agent-sessions-empty {
+  display: flex;
+  justify-content: center;
+  padding: 32px 0;
+}
+
+.agent-sessions-list .ant-empty {
+  margin: 24px 0;
+}
+
+.agent-sessions-list .ant-empty-description {
+  font-size: 12px;
+}
+
+.agent-session-item {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 30px 8px 10px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.agent-session-item:hover {
+  background: var(--page-bg);
+}
+
+.agent-session-item.active {
+  background: var(--page-bg);
+  border-color: rgba(22, 119, 255, 0.6);
+}
+
+.agent-session-title {
+  max-width: 100%;
+  overflow: hidden;
+  font-size: 13px;
+  color: var(--text-main);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-session-meta {
+  display: flex;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.agent-session-actions {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.agent-session-item:hover .agent-session-actions,
+.agent-session-item.active .agent-session-actions {
+  opacity: 1;
+}
+
+.agent-sessions-foot {
+  padding: 8px 12px;
+  border-top: 1px solid var(--panel-border);
+  overflow: hidden;
+  font-size: 11px;
+  color: var(--text-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-chat-loading {
+  display: flex;
+  justify-content: center;
+  padding: 48px 0;
+}
+
+.agent-warning-list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+  line-height: 1.8;
+}
+
+.agent-tool-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.chat-msg-tool .chat-avatar {
+  background: rgba(22, 119, 255, 0.12);
+  border-color: rgba(22, 119, 255, 0.3);
+  color: #1677ff;
+}
+
+.chat-msg-tool .chat-body {
+  max-width: min(860px, 84%);
+}
+
+.agent-tool-card {
+  padding: 8px 10px;
+  border: 1px solid var(--panel-border);
+  border-left: 3px solid #1677ff;
+  border-radius: 10px;
+  background: var(--page-bg);
+}
+
+.agent-tool-card-error {
+  border-left-color: #ff4d4f;
+}
+
+.agent-tool-args {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+  word-break: break-all;
+}
+
+.agent-tool-result {
+  margin: 0;
+  max-height: 280px;
+  overflow: auto;
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.agent-tool-doc {
+  padding: 8px 10px;
+  border: 1px dashed var(--panel-border);
+  border-radius: 8px;
+}
+
+.agent-tool-doc-desc {
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+
+@media (max-width: 1180px) {
+  .agent-chat-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .agent-sessions {
+    height: 220px;
+    min-height: 0;
+  }
+}
+
+.agent-composer-hint {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---- 通用 Agent：摘要与已压缩标记 ------------------------------------- */
+.agent-summary-banner {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  border: 1px dashed var(--panel-border);
+  border-radius: 10px;
+  background: var(--page-bg);
+}
+
+.agent-summary-text {
+  margin: 0;
+  max-height: 260px;
+  overflow: auto;
+  font-size: 12px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.agent-compressed-tag {
+  margin-inline-end: 0;
+  margin-bottom: 4px;
+  font-size: 11px;
+}

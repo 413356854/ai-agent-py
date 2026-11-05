@@ -18,6 +18,7 @@ from ai_agent_py.api.agents import router as agents_router
 from ai_agent_py.api.database import router as database_router
 from ai_agent_py.api.documents import asset_router
 from ai_agent_py.api.documents import router as documents_router
+from ai_agent_py.api.general_agent import router as general_agent_router
 from ai_agent_py.api.rag import router as rag_router
 from ai_agent_py.config import PROJECT_ROOT, Settings, get_settings
 from ai_agent_py.db.health import DatabaseHealth, check_database
@@ -25,14 +26,14 @@ from ai_agent_py.errors import AiAgentError, ConfigurationError
 from ai_agent_py.graph.agent import ask_agent, build_agent_graph
 from ai_agent_py.llm import get_chat_model
 from ai_agent_py.rag.chain import answer_question
-from ai_agent_py.rag.retriever import get_retriever
-from ai_agent_py.rag.store import build_vector_store, store_size
+from ai_agent_py.rag.milvus_search import get_milvus_searcher
+from ai_agent_py.rag.records import MilvusRagReader
 
 logger = logging.getLogger(__name__)
 
 WEB_DIST = PROJECT_ROOT / "web" / "dist"
 
-Resources = tuple[Settings, Any, Any, Any]
+Resources = tuple[Settings, Any, Any]
 
 
 class SPAStaticFiles(StaticFiles):
@@ -88,20 +89,19 @@ class HealthResponse(BaseModel):
 
 @lru_cache(maxsize=1)
 def _resources() -> Resources:
-    """Process wide singletons: settings, chat model, vector store, retriever."""
+    """Process wide singletons: settings, chat model, Milvus searcher."""
     cfg = get_settings()
     llm = get_chat_model(cfg)
-    store = build_vector_store(settings=cfg)
-    retriever = get_retriever(store=store, settings=cfg)
-    return cfg, llm, store, retriever
+    searcher = get_milvus_searcher(settings=cfg)
+    return cfg, llm, searcher
 
 
 @lru_cache(maxsize=1)
 def _agent_graph() -> Any:
     from langgraph.checkpoint.memory import InMemorySaver
 
-    _, llm, _, retriever = _resources()
-    return build_agent_graph(llm=llm, retriever=retriever, checkpointer=InMemorySaver())
+    _, llm, searcher = _resources()
+    return build_agent_graph(llm=llm, searcher=searcher, checkpointer=InMemorySaver())
 
 
 def _safe_resources() -> Resources:
@@ -109,13 +109,6 @@ def _safe_resources() -> Resources:
         return _resources()
     except ConfigurationError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-
-
-def _retriever_for(k: int | None) -> Any:
-    cfg, _, store, retriever = _safe_resources()
-    if k is None:
-        return retriever
-    return get_retriever(store=store, settings=cfg, k=k)
 
 
 def create_app() -> FastAPI:
@@ -131,15 +124,15 @@ def create_app() -> FastAPI:
         cfg = get_settings()
         chunks: int | None = None
         try:
-            chunks = store_size(_safe_resources()[2])
-        except HTTPException:
+            chunks = MilvusRagReader(cfg).count()
+        except AiAgentError:
             chunks = None
         return HealthResponse(
             status="ok",
             version=__version__,
             llm=cfg.llm_model,
-            vector_store=cfg.vector_store,
-            collection=cfg.collection_name,
+            vector_store="milvus",
+            collection=cfg.milvus_collection,
             chunks=chunks,
             database=check_database(cfg),
         )
@@ -150,9 +143,9 @@ def create_app() -> FastAPI:
 
     @app.post("/query", response_model=QueryResponse, tags=["rag"])
     def query(payload: QueryRequest) -> QueryResponse:
-        _, llm, _, _ = _safe_resources()
+        _, llm, searcher = _safe_resources()
         try:
-            result = answer_question(payload.question, llm=llm, retriever=_retriever_for(payload.k))
+            result = answer_question(payload.question, llm=llm, searcher=searcher, k=payload.k)
         except AiAgentError as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
         except Exception as exc:  # upstream provider errors
@@ -185,6 +178,9 @@ def create_app() -> FastAPI:
 
     # ---- Agent 应用（报销审核等，LangGraph 图导出）-----------------------
     app.include_router(agents_router)
+
+    # ---- 通用 Agent（全部工具 + MySQL 会话记忆，SSE 流式）----------------
+    app.include_router(general_agent_router)
 
     # ---- MySQL 连接诊断 -------------------------------------------------
     app.include_router(database_router)

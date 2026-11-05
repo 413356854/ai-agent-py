@@ -47,19 +47,6 @@ CREATE TABLE IF NOT EXISTS `tb_document_parse_job` (
   `asset_count` INT UNSIGNED NOT NULL DEFAULT 0
     COMMENT '结果里的图片等附件数量',
 
-  `ingest_chunks` INT UNSIGNED NULL
-    COMMENT '写入 Chroma 的 chunk 数；NULL 表示未入库',
-  `ingest_characters` INT UNSIGNED NULL
-    COMMENT '入库字符数',
-  `ingest_collection` VARCHAR(128) NULL
-    COMMENT '向量库集合名',
-  `ingest_store` VARCHAR(64) NULL
-    COMMENT '向量库实现，如 Chroma / InMemoryVectorStore',
-  `ingest_source` VARCHAR(512) NULL
-    COMMENT '入库来源（Markdown 绝对路径）',
-  `ingested_at` DATETIME(6) NULL
-    COMMENT 'Chroma 入库时间（UTC）',
-
   `rag_ingest_chunks` INT UNSIGNED NULL
     COMMENT '写入 Milvus rag_chunk 的 chunk 数；NULL 表示未入库 RAG',
   `rag_ingest_characters` INT UNSIGNED NULL

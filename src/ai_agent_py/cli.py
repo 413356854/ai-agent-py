@@ -31,12 +31,12 @@ from ai_agent_py.errors import AiAgentError
 from ai_agent_py.graph.agent import ask_agent, build_agent_graph
 from ai_agent_py.llm import get_chat_model
 from ai_agent_py.logging_setup import configure_logging
-from ai_agent_py.offline import LexicalHashEmbeddings, StaticChatModel
+from ai_agent_py.offline import LexicalHashEmbeddings, OfflineChunkSearcher, StaticChatModel
 from ai_agent_py.rag.chain import NO_CONTEXT_ANSWER, generate_answer, stream_answer
 from ai_agent_py.rag.ingest import IngestReport
 from ai_agent_py.rag.ingest import ingest as run_ingest
-from ai_agent_py.rag.retriever import get_retriever
-from ai_agent_py.rag.store import build_vector_store, store_size
+from ai_agent_py.rag.milvus_search import get_milvus_searcher
+from ai_agent_py.rag.records import MilvusRagReader
 
 app = typer.Typer(
     add_completion=False,
@@ -143,11 +143,11 @@ def info() -> None:
     console.print(table)
 
     try:
-        chunks = store_size(build_vector_store(settings=cfg))
+        chunks = MilvusRagReader(cfg).count()
     except AiAgentError as exc:
-        console.print(f"[yellow]无法打开向量库：{exc}[/]")
+        console.print(f"[yellow]无法读取 Milvus 索引：{exc}[/]")
     else:
-        console.print(f"已索引 chunk 数：[bold]{chunks if chunks is not None else '未知'}[/]")
+        console.print(f"已索引 chunk 数：[bold]{chunks}[/]")
 
 
 def _print_database(health: DatabaseHealth, *, dsn: str | None) -> None:
@@ -264,13 +264,12 @@ def ingest(
         list[str] | None,
         typer.Argument(help="文件或目录（可多个）；默认使用 DATA_DIR"),
     ] = None,
-    recreate: Annotated[bool, typer.Option("--recreate", "-r", help="清空集合后重建索引")] = False,
     chunk_size: Annotated[int | None, typer.Option("--chunk-size", help="分块大小（字符）")] = None,
     chunk_overlap: Annotated[
         int | None, typer.Option("--chunk-overlap", help="分块重叠（字符）")
     ] = None,
 ) -> None:
-    """把文档切块、向量化并写入向量库。"""
+    """把文档切块、向量化并写入 Milvus ``rag_chunk``（按源文件覆盖旧切片）。"""
     cfg = get_settings()
     targets: list[str | Path] = list(paths) if paths else [cfg.data_dir]
     console.print(f"文档来源：{[str(t) for t in targets]}")
@@ -285,7 +284,6 @@ def ingest(
         progress.update(task_id, completed=done)
 
     try:
-        store = build_vector_store(settings=cfg)
         with Progress(
             SpinnerColumn(),
             BarColumn(),
@@ -295,9 +293,7 @@ def ingest(
         ) as progress:
             report = run_ingest(
                 targets,
-                store=store,
                 settings=cfg,
-                recreate=recreate,
                 chunk_size=chunk_size,
                 chunk_overlap=chunk_overlap,
                 on_progress=on_progress,
@@ -329,13 +325,13 @@ def ask(
     cfg = get_settings()
     try:
         llm = get_chat_model(cfg, streaming=stream)
-        retriever = get_retriever(settings=cfg, k=k)
+        searcher = get_milvus_searcher(cfg)
     except AiAgentError as exc:
         raise _fail(str(exc)) from exc
 
     started = time.perf_counter()
     with console.status("[cyan]检索中…", spinner="dots"):
-        documents = list(retriever.invoke(question))
+        documents = searcher.search(question, k=k)
 
     if not documents:
         console.print(Panel(NO_CONTEXT_ANSWER, title="未命中", border_style="yellow"))
@@ -378,12 +374,12 @@ def chat(
     cfg = get_settings()
     try:
         llm = get_chat_model(cfg)
-        retriever = get_retriever(settings=cfg)
+        searcher = get_milvus_searcher(cfg)
     except AiAgentError as exc:
         raise _fail(str(exc)) from exc
 
     saver = InMemorySaver()
-    graph = build_agent_graph(llm=llm, retriever=retriever, checkpointer=saver)
+    graph = build_agent_graph(llm=llm, searcher=searcher, checkpointer=saver)
     console.print(
         Panel(
             "输入问题开始对话；[bold]/reset[/] 清空上下文，[bold]/exit[/] 退出。",
@@ -428,21 +424,16 @@ def demo(
 ) -> None:
     """离线演示：无需 API Key，跑通「加载 → 切块 → 向量化 → 检索 → 生成」。"""
     cfg = get_settings()
-    offline_cfg = cfg.model_copy(
-        update={"vector_store": "memory", "chunk_size": 500, "chunk_overlap": 80}
-    )
-    embeddings = LexicalHashEmbeddings()
+    offline_cfg = cfg.model_copy(update={"chunk_size": 500, "chunk_overlap": 80})
+    searcher = OfflineChunkSearcher(LexicalHashEmbeddings())
 
     console.print(
         Panel("离线模式：词法哈希向量 + 占位模型，仅用于验证流程是否跑通。", border_style="blue")
     )
 
     try:
-        store = build_vector_store(embeddings=embeddings, settings=offline_cfg)
         with console.status("[cyan]加载、切块、向量化…", spinner="dots"):
-            report = run_ingest(
-                [offline_cfg.data_dir], store=store, settings=offline_cfg, recreate=True
-            )
+            report = run_ingest([offline_cfg.data_dir], writer=searcher, settings=offline_cfg)
     except (AiAgentError, ValueError) as exc:
         raise _fail(str(exc)) from exc
 
@@ -450,8 +441,7 @@ def demo(
         raise _fail(f"data 目录中没有可索引的文档：{offline_cfg.data_dir}")
     _print_report(report)
 
-    retriever = get_retriever(store=store, settings=offline_cfg, k=3)
-    documents = list(retriever.invoke(question))
+    documents = searcher.search(question, k=3)
     console.print(f"\n问题：[bold]{question}[/]")
     _print_sources(documents)
 

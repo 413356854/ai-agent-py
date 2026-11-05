@@ -12,7 +12,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Protocol
@@ -38,7 +38,6 @@ from ai_agent_py.config import Settings
 from ai_agent_py.db.health import get_engine
 from ai_agent_py.errors import ConfigurationError, DatabaseError
 from ai_agent_py.mineru.models import (
-    IngestInfo,
     JobState,
     ParseJob,
     ParseOptions,
@@ -73,12 +72,6 @@ document_parse_job = Table(
     Column("zip_file", String(255)),
     Column("markdown_chars", Integer, nullable=False),
     Column("asset_count", Integer, nullable=False),
-    Column("ingest_chunks", Integer),
-    Column("ingest_characters", Integer),
-    Column("ingest_collection", String(128)),
-    Column("ingest_store", String(64)),
-    Column("ingest_source", String(512)),
-    Column("ingested_at", DateTime),
     Column("rag_ingest_chunks", Integer),
     Column("rag_ingest_characters", Integer),
     Column("rag_ingest_collection", String(128)),
@@ -111,9 +104,8 @@ def _aware_utc(value: datetime | None) -> datetime | None:
 
 
 def to_params(job: ParseJob) -> dict[str, Any]:
-    """`ParseJob` → 一行记录的列值（嵌套的 options / ingest / rag_ingest 摊平成列）。"""
+    """`ParseJob` → 一行记录的列值（嵌套的 options / rag_ingest 摊平成列）。"""
     options = job.options
-    ingest = job.ingest
     rag = job.rag_ingest
     return {
         "id": job.id,
@@ -136,12 +128,6 @@ def to_params(job: ParseJob) -> dict[str, Any]:
         "zip_file": job.zip_file,
         "markdown_chars": job.markdown_chars,
         "asset_count": job.asset_count,
-        "ingest_chunks": ingest.chunks if ingest else None,
-        "ingest_characters": ingest.characters if ingest else None,
-        "ingest_collection": ingest.collection if ingest else None,
-        "ingest_store": ingest.store if ingest else None,
-        "ingest_source": ingest.source if ingest else None,
-        "ingested_at": _naive_utc(ingest.ingested_at) if ingest else None,
         "rag_ingest_chunks": rag.chunks if rag else None,
         "rag_ingest_characters": rag.characters if rag else None,
         "rag_ingest_collection": rag.collection if rag else None,
@@ -158,16 +144,6 @@ def to_params(job: ParseJob) -> dict[str, Any]:
 
 def from_row(row: Mapping[str, Any]) -> ParseJob:
     """一行记录 → `ParseJob`（`to_params` 的逆操作）。"""
-    ingest: IngestInfo | None = None
-    if row["ingest_chunks"] is not None:
-        ingest = IngestInfo(
-            chunks=int(row["ingest_chunks"]),
-            characters=int(row["ingest_characters"] or 0),
-            collection=str(row["ingest_collection"] or ""),
-            store=str(row["ingest_store"] or ""),
-            source=str(row["ingest_source"] or ""),
-            ingested_at=_aware_utc(row["ingested_at"]) or datetime.now(UTC),
-        )
     rag_ingest: RagIngestInfo | None = None
     if row["rag_ingested_at"] is not None:
         rag_ingest = RagIngestInfo(
@@ -205,7 +181,6 @@ def from_row(row: Mapping[str, Any]) -> ParseJob:
         zip_file=row["zip_file"] or None,
         markdown_chars=int(row["markdown_chars"]),
         asset_count=int(row["asset_count"]),
-        ingest=ingest,
         rag_ingest=rag_ingest,
     )
 
@@ -275,6 +250,25 @@ class MySQLJobStore:
         except SQLAlchemyError as exc:
             raise _db_error("读取", exc) from exc
         return None if row is None else from_row(dict(row))
+
+    def load_file_names(self, doc_ids: Sequence[str]) -> dict[str, str]:
+        """按主键批量读取文件名（只查两列，供检索结果回填来源）。
+
+        ``rag_chunk`` 里只有 ``doc_id``，检索后拼引用时用这个方法一次查完，
+        避免为了几个文件名把整张任务表加载成 `ParseJob`。
+        """
+        ids = [doc_id for doc_id in dict.fromkeys(doc_ids) if doc_id]
+        if not ids:
+            return {}
+        statement = select(document_parse_job.c.id, document_parse_job.c.file_name).where(
+            document_parse_job.c.id.in_(ids)
+        )
+        try:
+            with self._engine.connect() as connection:
+                rows = connection.execute(statement).mappings().all()
+        except SQLAlchemyError as exc:
+            raise _db_error("读取", exc) from exc
+        return {str(row["id"]): str(row["file_name"]) for row in rows}
 
     def save(self, job: ParseJob) -> None:
         params = to_params(job)

@@ -126,7 +126,6 @@ export function DocumentParsePage() {
   const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([])
   const [options, setOptions] = useState<UploadOptions>(DEFAULT_OPTIONS)
   const [uploading, setUploading] = useState(false)
-  const [ingestingId, setIngestingId] = useState<string | null>(null)
   const [splitJob, setSplitJob] = useState<ParseJob | null>(null)
   const [preview, setPreview] = useState<PreviewState>({
     open: false,
@@ -312,19 +311,6 @@ export function DocumentParsePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [deepLinkJobId, jobs])
 
-  const handleIngest = async (job: ParseJob) => {
-    setIngestingId(job.id)
-    try {
-      const result = await api.ingest(job.id)
-      message.success(`已写入知识库：${result.chunks} 个片段 → ${result.collection}`)
-      await refreshJobs(true)
-    } catch (error) {
-      message.error(errorText(error))
-    } finally {
-      setIngestingId(null)
-    }
-  }
-
   const handleDelete = async (job: ParseJob) => {
     try {
       await api.remove(job.id)
@@ -385,11 +371,7 @@ export function DocumentParsePage() {
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
             {job.suffix.toUpperCase() || '—'} · {formatBytes(job.file_size)}
             {job.markdown_chars ? ` · ${job.markdown_chars.toLocaleString()} 字符` : ''}
-            {job.rag_ingest
-              ? ` · RAG 已入库 ${job.rag_ingest.chunks} 片段`
-              : job.ingest
-                ? ` · 已写入知识库 ${job.ingest.chunks} 片段`
-                : ''}
+            {job.rag_ingest ? ` · RAG 已入库 ${job.rag_ingest.chunks} 片段` : ''}
           </Typography.Text>
         </Space>
       ),
@@ -506,15 +488,6 @@ export function DocumentParsePage() {
               下载 <DownOutlined />
             </Button>
           </Dropdown>
-          <Button
-            type="link"
-            size="small"
-            disabled={job.state !== 'done'}
-            loading={ingestingId === job.id}
-            onClick={() => void handleIngest(job)}
-          >
-            入库
-          </Button>
           <Popconfirm
             title="删除该任务？"
             description="会同时删除解析结果与源文件，不可恢复。"

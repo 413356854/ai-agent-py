@@ -11,16 +11,7 @@ export interface ParseOptions {
   page_ranges: string | null
 }
 
-export interface IngestInfo {
-  chunks: number
-  characters: number
-  collection: string
-  store: string
-  source: string
-  ingested_at: string
-}
-
-/** RAG（Milvus `rag_chunk`）入库摘要；与 Chroma 的 `ingest` 分开记录。 */
+/** RAG（Milvus `rag_chunk`）入库摘要。 */
 export interface RagIngestInfo {
   chunks: number
   characters: number
@@ -49,7 +40,6 @@ export interface ParseJob {
   zip_file: string | null
   markdown_chars: number
   asset_count: number
-  ingest: IngestInfo | null
   /** 最近一次 RAG 入库摘要；null 表示未入库 RAG。 */
   rag_ingest: RagIngestInfo | null
   /** 后端计算的「是否已入库 RAG」状态。 */
@@ -84,15 +74,6 @@ export interface MarkdownOut {
   assets_base: string
   characters: number
   assets: number
-}
-
-export interface IngestResult {
-  job_id: string
-  chunks: number
-  characters: number
-  collection: string
-  store: string
-  source: string
 }
 
 /** 一个切分片段（与后端 `rag.models.ChunkOut` 对应）。 */
@@ -416,4 +397,170 @@ export interface AgentUploadResult {
   filename: string
   claim: ClaimData
   warnings: string[]
+}
+
+/* ---- 通用 Agent（全部工具 + MySQL 会话记忆） ---------------------------- */
+
+/** `GET /api/general-agent/overview` 里的一个工具。 */
+export interface GeneralAgentTool {
+  name: string
+  group: string
+  group_label: string
+  description: string
+}
+
+/** MySQL 会话记忆状态（表是否可读写、历史窗口、会话数）。 */
+export interface GeneralAgentMemory {
+  configured: boolean
+  ok: boolean
+  tables: string[]
+  agent_id: string
+  candidate_messages: number
+  session_count: number | null
+  summary_table_ready: boolean | null
+  error: string | null
+}
+
+/** 概览页展示的上下文预算配置。 */
+export interface GeneralAgentContextConfig {
+  model_context_tokens: number
+  history_budget_tokens: number
+  output_reserve_tokens: number
+  token_chars: number
+  history_keep_messages: number
+  tool_result_max_chars: number
+  tool_turn_max_chars: number
+  summary_enabled: boolean
+  summary_trigger_tokens: number
+  summary_keep_messages: number
+  summary_max_chars: number
+  overflow_retries: number
+}
+
+export interface GeneralAgentOverview {
+  ready: boolean
+  llm_model: string
+  llm_configured: boolean
+  max_turns: number
+  workspace: string
+  shell_enabled: boolean
+  tools: GeneralAgentTool[]
+  memory: GeneralAgentMemory
+  context: GeneralAgentContextConfig
+  warnings: string[]
+}
+
+/** 一轮对话实际使用的上下文统计。 */
+export interface AgentContextStats {
+  estimated_tokens: number
+  history_budget_tokens: number
+  model_context_tokens: number
+  messages_used: number
+  messages_dropped: number
+  summary_used: boolean
+  summary_chars: number
+  compressed_messages: number
+  summarized_messages: number
+  summary_error: string | null
+}
+
+/** 已压缩历史的摘要。 */
+export interface AgentChatSummary {
+  summary: string
+  until_seq: number
+  source_messages: number
+  tokens: number | null
+  model: string | null
+  updated_at: string | null
+}
+
+/** 一个 MySQL 会话（`GET /api/general-agent/sessions`）。 */
+export interface AgentChatSession {
+  thread_id: string
+  title: string
+  message_count: number
+  created_at: string
+  updated_at: string
+}
+
+export type AgentChatRole = 'user' | 'assistant' | 'tool'
+
+/** 会话里的一条消息（user / assistant / 工具调用记录）。 */
+export interface AgentChatMessage {
+  seq: number
+  role: AgentChatRole
+  content: string
+  /** 是否已被摘要覆盖：仍在 MySQL/界面里，但不再发送给模型。 */
+  compressed: boolean
+  tool_name: string | null
+  tool_call_id: string | null
+  tool_args: string | null
+  tool_status: string | null
+  elapsed_ms: number | null
+  created_at: string | null
+}
+
+export interface AgentChatMessageList {
+  thread_id: string
+  total: number
+  items: AgentChatMessage[]
+  summary: AgentChatSummary | null
+}
+
+/** `POST /api/general-agent/chat` 的响应。 */
+export interface AgentChatResponse {
+  answer: string
+  thread_id: string
+  session: AgentChatSession
+  tool_calls: number
+  elapsed_ms: number
+  context: AgentContextStats
+  summary: AgentChatSummary | null
+  messages: AgentChatMessage[]
+}
+
+/** 手动压缩结果（`POST /sessions/{id}/compact`）。 */
+export interface AgentCompactResult {
+  compacted: boolean
+  summary: string
+  until_seq: number
+  source_messages: number
+  tokens: number
+  summarized: number
+  message: string
+}
+
+export interface AgentToolCallEvent {
+  id: string
+  name: string
+  args: string | null
+  index: number
+}
+
+export interface AgentToolResultEvent {
+  id: string
+  name: string
+  status: string
+  elapsed_ms: number | null
+  content: string
+}
+
+/** SSE 事件回调（`POST /api/general-agent/chat/stream`）。 */
+export interface AgentChatStreamHandlers {
+  onStage?: (stage: string, message: string) => void
+  onSession?: (session: AgentChatSession) => void
+  onToolCall?: (call: AgentToolCallEvent) => void
+  onToolResult?: (result: AgentToolResultEvent) => void
+  onToken?: (text: string) => void
+  onDone?: (payload: {
+    answer: string
+    thread_id: string
+    session: AgentChatSession
+    tool_calls: number
+    elapsed_ms: number
+    context: AgentContextStats
+    summary: AgentChatSummary | null
+    messages: AgentChatMessage[]
+  }) => void
+  onError?: (message: string) => void
 }

@@ -28,7 +28,6 @@ from ai_agent_py.errors import (
 )
 from ai_agent_py.mineru.models import (
     DocumentConfigOut,
-    IngestResultOut,
     MarkdownOut,
     ParseJob,
     ParseOptions,
@@ -233,28 +232,6 @@ async def delete_document(request: Request, job_id: str) -> None:
     if not deleted:
         raise _not_found(job_id)
     return None
-
-
-@router.post("/{job_id}/ingest", response_model=IngestResultOut, summary="解析结果写入知识库")
-async def ingest_document(request: Request, job_id: str) -> IngestResultOut:
-    service = get_service(request)
-    try:
-        return await service.ingest(job_id)
-    except KeyError as exc:
-        raise _not_found(job_id) from exc
-    except DatabaseError as exc:
-        raise _storage_error(exc) from exc
-    except ConfigurationError as exc:
-        raise HTTPException(
-            status_code=503, detail=f"向量库未就绪：{exc}（请先配置 EMBEDDING_API_KEY）"
-        ) from exc
-    except (MineruError, DocumentLoadError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except AiAgentError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-    except Exception as exc:  # 向量模型/向量库的远端错误
-        logger.exception("入库失败")
-        raise HTTPException(status_code=502, detail=f"写入知识库失败: {exc}") from exc
 
 
 @router.get("/{job_id}/chunks", response_model=SplitPreviewOut, summary="切分预览")

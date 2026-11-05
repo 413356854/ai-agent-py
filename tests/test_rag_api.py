@@ -17,7 +17,6 @@ from ai_agent_py.config import Settings
 from ai_agent_py.errors import ConfigurationError, MilvusSchemaError
 from ai_agent_py.graph.rag_chat import build_rag_chat_graph
 from ai_agent_py.mineru.models import (
-    IngestInfo,
     JobState,
     ParseJob,
     ParseOptions,
@@ -29,7 +28,9 @@ from ai_agent_py.rag.records import (
     RagCollectionStats,
     RagDocStat,
 )
-from fakes import ScriptedChatModel, StreamingScriptedChatModel
+from fakes import FakeDocumentNameResolver, ScriptedChatModel, StreamingScriptedChatModel
+
+_FILE_NAME = "中华人民共和国企业所得税法实施条例.docx"
 
 _SETTINGS = Settings(
     _env_file=None,
@@ -104,21 +105,13 @@ def _job() -> ParseJob:
     ingested = datetime(2026, 11, 3, 7, 41, 37, tzinfo=UTC)
     return ParseJob(
         id="doc-a",
-        file_name="中华人民共和国企业所得税法实施条例.docx",
+        file_name=_FILE_NAME,
         file_size=23_997,
         suffix="docx",
         state=JobState.done,
         options=ParseOptions(),
         created_at=ingested,
         updated_at=ingested,
-        ingest=IngestInfo(
-            chunks=4,
-            characters=3_000,
-            collection="db_tax_rag.rag_chunk",
-            store="Milvus",
-            source="中华人民共和国企业所得税法实施条例.docx",
-            ingested_at=ingested,
-        ),
         rag_ingest=RagIngestInfo(
             chunks=4,
             characters=3_000,
@@ -147,7 +140,12 @@ def make_client(
 
 
 def make_graph(model: Any) -> Any:
-    return build_rag_chat_graph(llm=model, searcher=FakeSearcher(), settings=_SETTINGS)
+    return build_rag_chat_graph(
+        llm=model,
+        searcher=FakeSearcher(),
+        resolver=FakeDocumentNameResolver({"doc-a": _FILE_NAME}),
+        settings=_SETTINGS,
+    )
 
 
 def parse_sse(body: str) -> list[tuple[str, dict[str, Any]]]:
@@ -278,7 +276,7 @@ def test_chat_returns_answer_and_sources(monkeypatch) -> None:
     model = ScriptedChatModel(
         responses=[AIMessage(content="扣除项目包括成本、费用、税金和损失 [1]。")]
     )
-    client = make_client(monkeypatch, graph=make_graph(model), jobs={"doc-a": _job()})
+    client = make_client(monkeypatch, graph=make_graph(model))
 
     response = client.post(
         "/api/rag/chat",
@@ -294,7 +292,7 @@ def test_chat_returns_answer_and_sources(monkeypatch) -> None:
     assert source["index"] == 1
     assert source["chunk_id"] == "chunk-1"
     assert source["doc_id"] == "doc-a"
-    assert source["source"] == "中华人民共和国企业所得税法实施条例.docx"
+    assert source["source"] == _FILE_NAME
     assert source["page"] == 3
     assert source["score"] == 0.032
     assert source["reranked"] is False
@@ -307,9 +305,10 @@ def test_chat_marks_reranked_sources(monkeypatch) -> None:
     graph = build_rag_chat_graph(
         llm=model,
         searcher=FakeSearcher(reranked=True),
+        resolver=FakeDocumentNameResolver({"doc-a": _FILE_NAME}),
         settings=_SETTINGS,
     )
-    client = make_client(monkeypatch, graph=graph, jobs={"doc-a": _job()})
+    client = make_client(monkeypatch, graph=graph)
 
     response = client.post("/api/rag/chat", json={"message": "扣除项目有哪些？"})
 
@@ -344,7 +343,7 @@ def test_chat_stream_emits_stage_sources_tokens_and_done(monkeypatch) -> None:
         responses=[AIMessage(content="企业所得税的答案")],
         chunk_size=2,
     )
-    client = make_client(monkeypatch, graph=make_graph(model), jobs={"doc-a": _job()})
+    client = make_client(monkeypatch, graph=make_graph(model))
 
     response = client.post(
         "/api/rag/chat/stream",
@@ -364,7 +363,7 @@ def test_chat_stream_emits_stage_sources_tokens_and_done(monkeypatch) -> None:
 
     sources_event = events[1][1]
     assert sources_event["sources"][0]["chunk_id"] == "chunk-1"
-    assert sources_event["sources"][0]["source"] == "中华人民共和国企业所得税法实施条例.docx"
+    assert sources_event["sources"][0]["source"] == _FILE_NAME
 
     done = events[-1][1]
     assert done["answer"] == "企业所得税的答案"

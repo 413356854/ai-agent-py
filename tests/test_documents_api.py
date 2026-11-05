@@ -16,7 +16,6 @@ from ai_agent_py.config import Settings
 from ai_agent_py.errors import ConfigurationError
 from ai_agent_py.mineru.client import MineruClient
 from ai_agent_py.mineru.service import DocumentService
-from ai_agent_py.rag.ingest import IngestReport
 from ai_agent_py.rag.milvus import RagIngestReport
 from fakes import InMemoryJobStore
 from test_mineru import FakeMineru
@@ -181,52 +180,6 @@ def test_unknown_job_returns_404(tmp_path: Path) -> None:
         assert client.get("/api/documents/nope").status_code == 404
         assert client.get("/api/documents/nope/markdown").status_code == 404
         assert client.delete("/api/documents/nope").status_code == 404
-
-
-def test_ingest_requires_embeddings_configuration(tmp_path: Path) -> None:
-    client, _ = _app(tmp_path, FakeMineru())
-    with client:
-        job = client.post(
-            "/api/documents/parse", files={"file": ("a.pdf", b"%PDF", "application/pdf")}
-        ).json()
-        _wait(client, job["id"])
-        response = client.post(f"/api/documents/{job['id']}/ingest")
-    assert response.status_code == 503
-    assert "EMBEDDING_API_KEY" in response.json()["detail"]
-
-
-@pytest.mark.asyncio
-async def test_ingest_writes_to_vector_store(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    client, service = _app(tmp_path, FakeMineru())
-
-    def fake_ingest(path: Path) -> IngestReport:
-        assert path.name == "full.md"
-        return IngestReport(
-            files=1,
-            documents=1,
-            chunks=3,
-            characters=42,
-            batches=1,
-            store="InMemoryVectorStore",
-            collection="rag_docs",
-            elapsed_seconds=0.1,
-        )
-
-    monkeypatch.setattr(DocumentService, "_ingest_sync", lambda self, path: fake_ingest(path))
-
-    with client:
-        job = client.post(
-            "/api/documents/parse", files={"file": ("a.pdf", b"%PDF", "application/pdf")}
-        ).json()
-        _wait(client, job["id"])
-        response = client.post(f"/api/documents/{job['id']}/ingest")
-        assert response.status_code == 200, response.text
-        assert response.json()["chunks"] == 3
-        detail = client.get(f"/api/documents/{job['id']}").json()
-        assert detail["ingest"]["chunks"] == 3
-    assert await service.get(job["id"]) is not None
 
 
 def test_markdown_upload_is_directly_splittable(tmp_path: Path) -> None:
@@ -412,8 +365,6 @@ def test_rag_ingest_writes_milvus_and_updates_job(
         assert detail["rag_ingested"] is True
         assert detail["rag_ingest"]["collection"] == "db_tax_rag.rag_chunk"
         assert detail["rag_ingest"]["chunks"] == 2
-        # Chroma 的入库摘要不会被 RAG 入库覆盖
-        assert detail["ingest"] is None
 
         # 允许重复入库：第二次仍然成功，摘要按最新一次刷新
         again = client.post(

@@ -1,4 +1,4 @@
-"""Shared pytest fixtures: isolated settings, offline embeddings, memory store."""
+"""Shared pytest fixtures: isolated settings, offline embeddings, memory searcher."""
 
 from __future__ import annotations
 
@@ -7,11 +7,9 @@ from pathlib import Path
 
 import pytest
 from langchain_core.embeddings import Embeddings
-from langchain_core.vectorstores import VectorStore
 
 from ai_agent_py.config import Settings, reset_settings_cache
-from ai_agent_py.offline import LexicalHashEmbeddings
-from ai_agent_py.rag.store import build_vector_store
+from ai_agent_py.offline import LexicalHashEmbeddings, OfflineChunkSearcher
 
 _ENV_KEYS = (
     "APP_ENV",
@@ -25,9 +23,6 @@ _ENV_KEYS = (
     "EMBEDDING_DIMENSIONS",
     "EMBEDDING_BATCH_SIZE",
     "DASHSCOPE_API_KEY",
-    "VECTOR_STORE",
-    "COLLECTION_NAME",
-    "CHROMA_DIR",
     "DATA_DIR",
     "MILVUS_URI",
     "MILVUS_TOKEN",
@@ -48,6 +43,41 @@ _ENV_KEYS = (
     "CHUNK_SIZE",
     "CHUNK_OVERLAP",
     "RETRIEVER_K",
+    "AGENT_WORKSPACE",
+    "AGENT_SHELL_TIMEOUT",
+    "AGENT_SHELL_MAX_OUTPUT",
+    "AGENT_MEMORY_SESSIONS",
+    "AGENT_MODEL_CONTEXT_TOKENS",
+    "AGENT_CONTEXT_MAX_TOKENS",
+    "AGENT_OUTPUT_RESERVE_TOKENS",
+    "AGENT_CONTEXT_SAFETY_TOKENS",
+    "AGENT_TOKEN_CHARS",
+    "AGENT_MEMORY_CANDIDATES",
+    "AGENT_HISTORY_KEEP_MESSAGES",
+    "AGENT_MESSAGE_MAX_CHARS",
+    "AGENT_TOOL_RESULT_MAX_CHARS",
+    "AGENT_TOOL_RESULT_HEAD_CHARS",
+    "AGENT_TOOL_RESULT_TAIL_CHARS",
+    "AGENT_TOOL_TURN_MAX_CHARS",
+    "AGENT_SUMMARY_ENABLED",
+    "AGENT_SUMMARY_TRIGGER_TOKENS",
+    "AGENT_SUMMARY_KEEP_MESSAGES",
+    "AGENT_SUMMARY_MAX_CHARS",
+    "AGENT_SUMMARY_MAX_TOKENS",
+    "AGENT_SUMMARY_INPUT_MAX_CHARS",
+    "AGENT_CONTEXT_OVERFLOW_RETRIES",
+    "WEB_SEARCH_API_KEY",
+    "WEB_SEARCH_BASE_URL",
+    "WEB_SEARCH_MODEL",
+    "WEB_SEARCH_STRATEGY",
+    "WEB_SEARCH_FORCED",
+    "WEB_SEARCH_ENABLE_CITATION",
+    "WEB_SEARCH_TIMEOUT",
+    "WEB_EXTRACTOR_BASE_URL",
+    "WEB_EXTRACTOR_API_KEY",
+    "WEB_EXTRACTOR_MODEL",
+    "WEB_EXTRACTOR_TIMEOUT",
+    "WEB_EXTRACTOR_MAX_CHARS",
     "MYSQL_URL",
     "MYSQL_USERNAME",
     "MYSQL_PASSWORD",
@@ -73,8 +103,6 @@ def settings(tmp_path: Path) -> Settings:
     return Settings(
         _env_file=None,
         app_env="test",
-        vector_store="memory",
-        chroma_dir=tmp_path / "chroma",
         data_dir=tmp_path / "raw",
     )
 
@@ -85,8 +113,9 @@ def embeddings() -> Embeddings:
 
 
 @pytest.fixture
-def store(settings: Settings, embeddings: Embeddings) -> VectorStore:
-    return build_vector_store(embeddings=embeddings, settings=settings)
+def searcher(embeddings: Embeddings) -> OfflineChunkSearcher:
+    """离线检索器：同时是 `ingest` 的写入器，行为对齐 Milvus 那条链路。"""
+    return OfflineChunkSearcher(embeddings)
 
 
 @pytest.fixture

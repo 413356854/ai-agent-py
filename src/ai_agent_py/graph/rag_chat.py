@@ -1,18 +1,21 @@
-"""RAG 问答的 LangGraph 编排：condense → retrieve → answer。
+"""RAG 问答的 LangGraph 编排：condense → retrieve → resolve → answer。
 
 与 `graph.agent` 里的 ReAct 智能体不同，这里是一条**固定的检索增强链**，
-把「多轮改写、检索、生成」拆成三个可单独测试的节点：
+把「多轮改写、检索、补文件名、生成」拆成四个可单独测试的节点：
 
-    START ──▶ condense ──▶ retrieve ──▶ answer ──▶ END
-              改写追问      混合检索      带引用作答
+    START ──▶ condense ──▶ retrieve ──▶ resolve ──▶ answer ──▶ END
+              改写追问      混合检索      回查文件名     带引用作答
 
 * ``condense``：只有存在历史对话时才调 LLM，把「那它的扣除标准呢？」改写成
   「业务招待费的扣除标准是什么？」这种可独立检索的问题；首轮直接使用原问题，
   不额外消耗一次模型调用。
 * ``retrieve``：委托 `MilvusChunkSearcher` 在 ``rag_chunk`` 上做混合检索，
   融合结果再交给可选的精排模型（``qwen3.7-text-rerank``）重新打分。
-* ``answer``：把召回片段按 ``[1] [2]`` 编号拼进提示词；没有召回时**不调用 LLM**，
-  直接返回兜底文案（省钱、避免幻觉）。
+* ``resolve``：Milvus 里只有 ``doc_id``，这里按 ``doc_id`` 批量回查 MySQL
+  ``tb_document_parse_job`` 的文件名，写回 ``metadata["source"]``；查不到就
+  退回 ``doc_id``，不影响问答。
+* ``answer``：把召回片段按 ``[1] [2]`` 编号拼进提示词，来源就是上一步补好的
+  文件名；没有召回时**不调用 LLM**，直接返回兜底文案（省钱、避免幻觉）。
 
 多轮上下文由 LangGraph 的 checkpointer 保存，API 层为每个 ``thread_id`` 建一条会话。
 """
@@ -36,6 +39,11 @@ from ai_agent_py.config import Settings, get_settings
 from ai_agent_py.graph.agent import message_text
 from ai_agent_py.llm import get_chat_model
 from ai_agent_py.rag.chain import format_documents, normalize_citations
+from ai_agent_py.rag.doc_names import (
+    DocumentNameResolver,
+    MySQLDocumentNameResolver,
+    apply_document_names,
+)
 from ai_agent_py.rag.milvus_search import DocumentSearcher, get_milvus_searcher
 
 if TYPE_CHECKING:
@@ -84,7 +92,8 @@ SYSTEM_PROMPT = """你是「企业知识库问答助手」，只能依据【参�
    对不上就删掉这句话，或改写为「资料中未提及」。
 
 【事实与数字】
-5. 只使用参考资料中的信息作答，不要依赖先验知识，不要编造事实、文件名、文号、日期。
+5. 只使用参考资料中的信息作答，不要依赖先验知识，不要编造事实、文号、日期；
+   文件名以资料开头的「来源」为准，不要自己猜。
 6. 资料不足以回答时，直接说明「资料中未找到相关内容」，并指出还缺少什么信息。
 7. 涉及税率、金额、期限、比例等数字时原样引用，不要改写、换算或估算。
 
@@ -92,6 +101,7 @@ SYSTEM_PROMPT = """你是「企业知识库问答助手」，只能依据【参�
 8. 结合对话历史理解追问，但事实依据只能来自本次检索到的资料。
 9. 使用简体中文：先给结论，再分点说明，必要时用列表；不要大段复制资料原文。
 10. 不要在回答末尾另列「参考资料」清单，界面已经展示引用来源。
+11. 需要说明出处时可以写资料里的文件名；方括号里仍然只能写编号，文件名不能代替 [n]。
 
 【示例】
 参考资料（共 3 条，编号 1~3）：
@@ -172,6 +182,19 @@ def build_retrieve_node(
     return retrieve
 
 
+def build_resolve_node(
+    resolver: DocumentNameResolver | None,
+) -> Callable[[RagChatState], Any]:
+    """检索后按 ``doc_id`` 回查 MySQL 文件名，写回 ``metadata["source"]``。"""
+
+    def resolve(state: RagChatState) -> dict[str, Any]:
+        """节点：把片段的 doc_id 来源补成 MySQL 里的文件名。"""
+        documents = list(state.get("documents") or [])
+        return {"documents": apply_document_names(documents, resolver)}
+
+    return resolve
+
+
 def build_answer_node(
     llm: BaseChatModel,
     *,
@@ -231,19 +254,22 @@ def build_rag_chat_graph(
     *,
     llm: BaseChatModel | None = None,
     searcher: DocumentSearcher | None = None,
+    resolver: DocumentNameResolver | None = None,
     checkpointer: Any | None = None,
     settings: Settings | None = None,
     system_prompt: str = SYSTEM_PROMPT,
     condense_prompt: ChatPromptTemplate = CONDENSE_PROMPT,
 ) -> CompiledStateGraph:
-    """编译 RAG 问答图；``llm`` / ``searcher`` 可注入，测试不需要真实模型或 Milvus。"""
+    """编译 RAG 问答图；模型 / 检索器 / 文件名解析器都可注入，测试不连外部服务。"""
     cfg = settings or get_settings()
     model = llm or get_chat_model(cfg, streaming=True)
     chunk_searcher = searcher or get_milvus_searcher(settings=cfg)
+    name_resolver = resolver if resolver is not None else MySQLDocumentNameResolver(cfg)
 
     builder = StateGraph(RagChatState)
     _add_node(builder, "condense", build_condense_node(model, prompt=condense_prompt))
     _add_node(builder, "retrieve", build_retrieve_node(chunk_searcher))
+    _add_node(builder, "resolve", build_resolve_node(name_resolver))
     _add_node(
         builder,
         "answer",
@@ -251,7 +277,8 @@ def build_rag_chat_graph(
     )
     builder.add_edge(START, "condense")
     builder.add_edge("condense", "retrieve")
-    builder.add_edge("retrieve", "answer")
+    builder.add_edge("retrieve", "resolve")
+    builder.add_edge("resolve", "answer")
     builder.add_edge("answer", END)
     return builder.compile(checkpointer=checkpointer)
 

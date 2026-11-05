@@ -4,7 +4,8 @@
 
 * ``GET /overview``：Milvus 连接参数、模型配置、总块数与文档分布；
 * ``GET /chunks``：分页查询 ``rag_chunk``（按文档 / 正文关键词过滤）；
-* ``POST /chat``：LangGraph 多轮问答（同步返回答案 + 引用）；
+* ``POST /chat``：LangGraph 多轮问答（同步返回答案 + 引用；来源已按 ``doc_id``
+  回查 MySQL 文件名）；
 * ``POST /chat/stream``：同上，用 SSE 逐 token 推送，供聊天界面使用。
 
 Milvus / 模型不可用时返回 502/503 与中文原因，前端直接展示，不用猜。
@@ -30,6 +31,7 @@ from ai_agent_py.graph.agent import message_text
 from ai_agent_py.graph.rag_chat import ask_rag_chat, build_rag_chat_graph, rag_chat_config
 from ai_agent_py.llm import get_chat_model
 from ai_agent_py.mineru.models import ParseJob
+from ai_agent_py.rag.doc_names import DOC_NAME_KEY, SOURCE_KEY
 from ai_agent_py.rag.milvus_search import MilvusChunkSearcher
 from ai_agent_py.rag.models import (
     RagChatRequest,
@@ -61,7 +63,7 @@ def _reader() -> MilvusRagReader:
 
 @lru_cache(maxsize=1)
 def _chat_graph() -> CompiledStateGraph:
-    """LangGraph RAG 图：流式模型 + Milvus 混合检索（RRF + 精排）+ 进程内多轮记忆。"""
+    """LangGraph RAG 图：流式模型 + Milvus 混合检索（RRF + 精排）+ MySQL 文件名回查 + 进程内多轮记忆。"""
     from langgraph.checkpoint.memory import InMemorySaver
 
     cfg = get_settings()
@@ -185,9 +187,7 @@ def list_chunks(
 
 @router.post("/chat", response_model=RagChatResponse, summary="RAG 问答（LangGraph，多轮）")
 def chat(payload: RagChatRequest) -> RagChatResponse:
-    cfg = get_settings()
     graph = _graph_or_503()
-    jobs = _document_jobs(cfg)
     try:
         turn = ask_rag_chat(graph, payload.message, thread_id=payload.thread_id)
     except AiAgentError as exc:
@@ -199,7 +199,7 @@ def chat(payload: RagChatRequest) -> RagChatResponse:
         answer=turn.answer,
         thread_id=payload.thread_id,
         query=turn.query,
-        sources=_sources(turn.documents, jobs),
+        sources=_sources(turn.documents),
     )
 
 
@@ -207,14 +207,13 @@ def chat(payload: RagChatRequest) -> RagChatResponse:
 def chat_stream(payload: RagChatRequest) -> StreamingResponse:
     """逐 token 推送答案；事件类型见 ``_stream_events``。
 
-    先返回 ``sources``（引用片段），再连续返回 ``token``，最后 ``done`` 带完整答案。
-    出错时返回 ``error`` 事件（HTTP 状态码此时已是 200，前端按事件处理）。
+    先返回 ``sources``（引用片段，文件名已按 doc_id 从 MySQL 回查），再连续返回
+    ``token``，最后 ``done`` 带完整答案。出错时返回 ``error`` 事件
+    （HTTP 状态码此时已是 200，前端按事件处理）。
     """
-    cfg = get_settings()
-    jobs = _document_jobs(cfg)
     graph = _graph_or_503()
     return StreamingResponse(
-        _stream_events(graph, payload, jobs),
+        _stream_events(graph, payload),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -228,7 +227,6 @@ def chat_stream(payload: RagChatRequest) -> StreamingResponse:
 def _stream_events(
     graph: CompiledStateGraph,
     payload: RagChatRequest,
-    jobs: Mapping[str, ParseJob],
 ) -> Iterator[str]:
     """把 LangGraph 的 messages / updates 流翻译成前端消费的 SSE 事件。"""
     config = rag_chat_config(thread_id=payload.thread_id)
@@ -269,13 +267,15 @@ def _stream_events(
                     elif node == "retrieve":
                         documents = list(update.get("documents") or [])
                         query = str(update.get("query") or query)
+                    elif node == "resolve":
+                        # retrieve 之后才拿到文件名：引用事件放在 resolve 完成时发，
+                        # 前端展示的 source 与提示词里的来源保持一致。
+                        documents = list(update.get("documents") or [])
                         yield _sse(
                             "sources",
                             {
                                 "query": query,
-                                "sources": [
-                                    source.model_dump() for source in _sources(documents, jobs)
-                                ],
+                                "sources": [source.model_dump() for source in _sources(documents)],
                             },
                         )
                     elif node == "answer":
@@ -292,7 +292,7 @@ def _stream_events(
         {
             "answer": answer,
             "query": query,
-            "sources": [source.model_dump() for source in _sources(documents, jobs)],
+            "sources": [source.model_dump() for source in _sources(documents)],
         },
     )
 
@@ -340,18 +340,20 @@ def _doc_out(doc_id: str, chunks: int, jobs: Mapping[str, ParseJob]) -> RagDocOu
     )
 
 
-def _sources(documents: Sequence[Document], jobs: Mapping[str, ParseJob]) -> list[RagSourceOut]:
+def _sources(documents: Sequence[Document]) -> list[RagSourceOut]:
     sources: list[RagSourceOut] = []
     for index, document in enumerate(documents, start=1):
         metadata = document.metadata
         doc_id = str(metadata.get("doc_id") or "")
-        job = jobs.get(doc_id)
         sources.append(
             RagSourceOut(
                 index=index,
                 chunk_id=str(metadata.get("chunk_id") or document.id or ""),
                 doc_id=doc_id,
-                source=job.file_name if job else (doc_id or "unknown"),
+                # resolve 节点已经把 source 换成 MySQL 文件名；查不到时退回 doc_id。
+                source=str(
+                    metadata.get(DOC_NAME_KEY) or metadata.get(SOURCE_KEY) or doc_id or "unknown"
+                ),
                 page=_as_int(metadata.get("page")) or None,
                 chunk_index=_as_int(metadata.get("chunk_index")),
                 score=_as_float(metadata.get("score")),
