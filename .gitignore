@@ -21,6 +21,7 @@ htmlcov/
 
 # ---- data -----------------------------------------------------------------
 data/parsed/
+data/rag_delete_pending/
 data/raw/*
 !data/raw/.gitkeep
 !data/raw/sample.md

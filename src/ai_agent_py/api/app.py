@@ -205,6 +205,13 @@ def create_app() -> FastAPI:
         if service is not None:
             await service.aclose()
 
+    @app.on_event("shutdown")
+    async def _close_documents() -> None:
+        """关停时取消补删重试（标记留在磁盘）；正在解析的任务留给下次启动续跑。"""
+        service = getattr(app.state, "documents", None)
+        if service is not None:
+            await service.aclose()
+
     # ---- 静态资源：管理后台前端 ------------------------------------------
     if (WEB_DIST / "index.html").is_file():
         app.mount("/", SPAStaticFiles(directory=WEB_DIST, html=True), name="web")

@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 from ai_agent_py.api.app import create_app
 from ai_agent_py.api.documents import _PAGE_RANGES as PAGE_RANGES
 from ai_agent_py.config import Settings
-from ai_agent_py.errors import ConfigurationError
+from ai_agent_py.errors import ConfigurationError, MilvusError
 from ai_agent_py.mineru.client import MineruClient
 from ai_agent_py.mineru.service import DocumentService
 from ai_agent_py.rag.milvus import RagIngestReport
@@ -31,6 +31,7 @@ def _app(tmp_path: Path, fake: FakeMineru, **overrides: Any) -> tuple[TestClient
         mineru_output_dir=tmp_path / "parsed",
         mineru_poll_interval=0,
         mineru_timeout=10,
+        rag_delete_pending_dir=tmp_path / "rag_delete_pending",
         **overrides,
     )
     service = DocumentService(
@@ -545,6 +546,56 @@ def test_delete_job_drops_cached_splits(tmp_path: Path) -> None:
 
         assert client.delete(f"/api/documents/{job['id']}").status_code == 204
         assert len(service.chunk_cache) == 0
+
+
+def test_delete_document_purges_rag_chunks_and_queues_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """删除对称：入过库的文档要一起删掉 rag_chunk；Milvus 故障只入补删队列。"""
+
+    def fake_ingest(self: DocumentService, doc_id: str, chunks: list[Any]) -> RagIngestReport:
+        return RagIngestReport(
+            chunks=len(chunks),
+            characters=sum(len(chunk.page_content) for chunk in chunks),
+            database="db_tax_rag",
+            collection="rag_chunk",
+        )
+
+    monkeypatch.setattr(DocumentService, "_write_rag_sync", fake_ingest)
+    client, service = _app(tmp_path, FakeMineru())
+
+    with client:
+        job = client.post(
+            "/api/documents/parse",
+            files={"file": ("a.md", b"# A\n\nB", "text/markdown")},
+        ).json()
+        assert client.post(f"/api/documents/{job['id']}/rag", json={}).status_code == 200
+
+        deleted: list[str] = []
+        monkeypatch.setattr(
+            DocumentService,
+            "_delete_rag_sync",
+            lambda self, doc_id: deleted.append(doc_id) or 1,
+        )
+        assert client.delete(f"/api/documents/{job['id']}").status_code == 204
+        assert deleted == [job["id"]]
+        assert client.get(f"/api/documents/{job['id']}").status_code == 404
+        assert service.delete_queue.items() == []
+
+        # Milvus 又挂了：任务照删（204），doc_id 落进补删队列等后台重试。
+        second = client.post(
+            "/api/documents/parse",
+            files={"file": ("b.md", b"# B\n\nC", "text/markdown")},
+        ).json()
+        assert client.post(f"/api/documents/{second['id']}/rag", json={}).status_code == 200
+
+        def boom(self: DocumentService, doc_id: str) -> int:
+            raise MilvusError("Milvus 连接失败")
+
+        monkeypatch.setattr(DocumentService, "_delete_rag_sync", boom)
+        assert client.delete(f"/api/documents/{second['id']}").status_code == 204
+        assert client.get(f"/api/documents/{second['id']}").status_code == 404
+        assert [item.doc_id for item in service.delete_queue.items()] == [second["id"]]
 
 
 def test_rag_ingest_rejects_empty_reviewed_chunks(tmp_path: Path) -> None:

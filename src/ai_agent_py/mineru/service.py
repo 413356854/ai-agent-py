@@ -7,7 +7,9 @@
 * 结果解包后保存 Markdown 与图片，并把任务记录按行 upsert 到 MySQL 表
   ``tb_document_parse_job``（见 `ai_agent_py.db.document_jobs`），
   服务重启后可以继续轮询未完成的任务；
-* 可选地把解析出的 Markdown 送进现有 RAG 索引（``/api/documents/{id}/ingest``）。
+* 可选地把解析出的 Markdown 送进现有 RAG 索引（``/api/documents/{id}/ingest``）；
+* 删除任务时同步删除 ``rag_chunk`` 里该文档的全部切片（删除对称）；Milvus 不可用时
+  把待删的 ``doc_id`` 落盘到补删队列（``rag.deletions``），后台重试，不阻塞删除。
 
 内存里的 `_jobs` 只用于两件事：让后台任务持有正在处理的任务对象；
 以及服务启动时把未完成的任务恢复出来。**所有读路径（列表 / 详情 / 预览 / 下载 / 入库）
@@ -25,6 +27,7 @@ import re
 import shutil
 import time
 from collections.abc import AsyncIterable, Callable, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -44,6 +47,7 @@ from ai_agent_py.mineru.models import (
     RagIngestInfo,
 )
 from ai_agent_py.rag.chunk_cache import ChunkCache
+from ai_agent_py.rag.deletions import RagDeleteQueue
 from ai_agent_py.rag.loaders import read_text
 from ai_agent_py.rag.models import (
     ChunkIn,
@@ -111,6 +115,17 @@ _JSON_FENCE = re.compile(r"```json[ \t]*\r?\n(?P<payload>.*?)\r?\n```", re.DOTAL
 #: 前端回传切片时保留的 metadata（其余字段丢弃，避免任意 JSON 进向量库）。
 _REVIEW_METADATA_KEYS = ("h1", "h2", "h3", "h4", "page", "start_index")
 
+#: RAG 切片补删的后台重试间隔（秒）；队列清空后后台任务会自己退出。
+DELETE_RETRY_SECONDS = 60.0
+
+
+@dataclass(slots=True)
+class RagDeleteFlush:
+    """一次补删重试的结果：本轮删掉几条、还剩几条（失败的会在后台继续重试）。"""
+
+    deleted: int
+    remaining: int
+
 
 def safe_file_name(raw: str | None, *, fallback: str = "document") -> str:
     """把用户上传的文件名收敛成安全的单段文件名。"""
@@ -130,7 +145,7 @@ def _now() -> datetime:
 
 
 class DocumentService:
-    """解析任务的创建、调度、查询与结果管理。"""
+    """解析任务的创建、调度、查询、删除与结果管理。"""
 
     def __init__(
         self,
@@ -139,6 +154,8 @@ class DocumentService:
         client_factory: ClientFactory | None = None,
         store: JobStore | None = None,
         chunk_cache: ChunkCache | None = None,
+        delete_queue: RagDeleteQueue | None = None,
+        delete_retry_seconds: float = DELETE_RETRY_SECONDS,
     ) -> None:
         self.settings = settings or get_settings()
         self._client_factory: ClientFactory = client_factory or (
@@ -155,6 +172,10 @@ class DocumentService:
         self._semaphore_loop: asyncio.AbstractEventLoop | None = None
         #: 切分结果缓存：预览返回 split_id，入库时按 id 取回完整切片。
         self.chunk_cache = chunk_cache or ChunkCache()
+        #: RAG 切片补删队列：删除文档时 Milvus 不可用，标记落盘后后台重试。
+        self._delete_queue = delete_queue
+        self._delete_retry_seconds = max(0.05, delete_retry_seconds)
+        self._delete_retry_task: asyncio.Task[None] | None = None
 
     @property
     def store(self) -> JobStore:
@@ -162,6 +183,13 @@ class DocumentService:
         if self._store is None:
             self._store = MySQLJobStore.from_settings(self.settings)
         return self._store
+
+    @property
+    def delete_queue(self) -> RagDeleteQueue:
+        """RAG 补删队列；默认落在 ``RAG_DELETE_PENDING_DIR``。"""
+        if self._delete_queue is None:
+            self._delete_queue = RagDeleteQueue(self.settings.rag_delete_pending_dir)
+        return self._delete_queue
 
     # ---- 路径 ----------------------------------------------------------
     @property
@@ -184,13 +212,15 @@ class DocumentService:
 
     # ---- 生命周期 ------------------------------------------------------
     async def ensure_loaded(self) -> None:
-        """首次使用时从 MySQL 载入任务记录，并恢复未完成的任务。"""
+        """首次使用时载入任务记录、恢复未完成任务与 RAG 补删队列。"""
         if self._loaded:
             return
         async with self._load_lock:
             if self._loaded:
                 return
             self.output_dir.mkdir(parents=True, exist_ok=True)
+            # 补删队列只在磁盘上、不依赖 MySQL：先恢复它，数据库挂了也能继续删向量。
+            await self._resume_pending_deletes()
             jobs = await asyncio.to_thread(self.store.load_all)
             for job in jobs:
                 self._jobs[job.id] = job
@@ -203,12 +233,25 @@ class DocumentService:
                 self._spawn(job)
 
     async def shutdown(self) -> None:
-        """取消所有正在轮询的任务（测试与优雅退出用）。"""
+        """取消所有正在轮询的任务与补删重试（测试与优雅退出用）。"""
         for task in list(self._tasks.values()):
             task.cancel()
         if self._tasks:
             await asyncio.gather(*self._tasks.values(), return_exceptions=True)
         self._tasks.clear()
+        await self.aclose()
+
+    async def aclose(self) -> None:
+        """只停掉补删重试，不动正在解析的任务。
+
+        应用关停时用这个：未解析完的任务保留在 ``parsing`` 状态，下次启动会从 MySQL
+        恢复并继续轮询；补删标记本来就在磁盘上，重试任务停掉也不会丢。
+        """
+        retry = self._delete_retry_task
+        self._delete_retry_task = None
+        if retry is not None and not retry.done():
+            retry.cancel()
+            await asyncio.gather(retry, return_exceptions=True)
 
     # ---- 查询 ----------------------------------------------------------
     async def get(self, job_id: str) -> ParseJob | None:
@@ -362,6 +405,12 @@ class DocumentService:
 
     # ---- 删除 / 结果 ---------------------------------------------------
     async def delete(self, job_id: str) -> bool:
+        """删除任务记录、结果目录与 RAG 切片。
+
+        RAG 切片删除是「删除对称」的一环：入过库的文档必须同时清掉 ``rag_chunk``
+        里该 ``doc_id`` 的全部切片，否则问答还会引用已删除的文档。Milvus 不可用时
+        只把 ``doc_id`` 记进补删队列并转后台重试，**不阻塞任务删除**。
+        """
         job = await self.get(job_id)
         if job is None:
             return False
@@ -373,10 +422,127 @@ class DocumentService:
         async with self._lock:
             self._jobs.pop(job_id, None)
         self.chunk_cache.drop_job(job_id)
+        await self._purge_rag_chunks(job)
         await asyncio.to_thread(self.store.delete, job_id)
         await asyncio.to_thread(shutil.rmtree, self.job_dir(job_id), True)
         logger.info("删除解析任务 %s (%s)", job_id, job.file_name)
         return True
+
+    async def _purge_rag_chunks(self, job: ParseJob) -> bool:
+        """删除该文档在 ``rag_chunk`` 里的全部切片，返回是否一次成功。
+
+        没有 ``rag_ingest`` 摘要的任务没写过向量，直接跳过：解析任务本身不需要
+        连 Milvus，只有入过库的文档才需要「删除对称」。失败转入补删队列，异常
+        不会抛给调用方。
+        """
+        if job.rag_ingest is None:
+            return True
+        try:
+            deleted = await asyncio.to_thread(self._delete_rag_sync, job.id)
+        except Exception as exc:
+            error = str(exc).strip() or exc.__class__.__name__
+            logger.warning("删除文档 %s 的 RAG 切片失败，转入补删队列：%s", job.id, error)
+            await asyncio.to_thread(
+                self._record_pending_delete,
+                job.id,
+                file_name=job.file_name,
+                collection=job.rag_ingest.collection,
+                error=error,
+            )
+            self._schedule_delete_retry()
+            return False
+        logger.info("已删除文档 %s 的 RAG 切片（%s 块）", job.id, deleted)
+        # 上一次补删留下的标记（如果有）也该清掉：这次已经删成功了。
+        await asyncio.to_thread(self.delete_queue.discard, job.id)
+        return True
+
+    def _delete_rag_sync(self, doc_id: str) -> int:
+        from ai_agent_py.rag.milvus import MilvusRagWriter
+
+        return MilvusRagWriter(self.settings).delete_document(doc_id)
+
+    def _record_pending_delete(
+        self,
+        doc_id: str,
+        *,
+        file_name: str | None = None,
+        collection: str | None = None,
+        error: str = "",
+    ) -> None:
+        """把「还没删掉」的 doc_id 落盘；队列目录都写不了时只记日志，不丢任务删除。"""
+        try:
+            self.delete_queue.record(
+                doc_id,
+                file_name=file_name,
+                collection=collection,
+                error=error,
+            )
+        except Exception as exc:
+            logger.error("记录 RAG 补删失败（doc_id=%s，需手工清理）：%s", doc_id, exc)
+
+    async def flush_pending_deletes(self) -> RagDeleteFlush:
+        """重试补删队列：成功一条删一条标记，失败累加 ``attempts`` 后保留。"""
+        try:
+            pending = await asyncio.to_thread(self.delete_queue.items)
+        except Exception as exc:
+            logger.warning("读取 RAG 补删队列失败：%s", exc)
+            return RagDeleteFlush(deleted=0, remaining=0)
+
+        deleted = 0
+        remaining = 0
+        for item in pending:
+            try:
+                await asyncio.to_thread(self._delete_rag_sync, item.doc_id)
+            except Exception as exc:
+                remaining += 1
+                error = str(exc).strip() or exc.__class__.__name__
+                logger.warning(
+                    "补删 RAG 切片仍失败（doc_id=%s，第 %d 次）：%s",
+                    item.doc_id,
+                    item.attempts + 1,
+                    error,
+                )
+                await asyncio.to_thread(
+                    self._record_pending_delete,
+                    item.doc_id,
+                    file_name=item.file_name,
+                    collection=item.collection,
+                    error=error,
+                )
+                continue
+            await asyncio.to_thread(self.delete_queue.discard, item.doc_id)
+            deleted += 1
+            logger.info("补删成功：doc_id=%s（第 %d 次尝试）", item.doc_id, item.attempts + 1)
+        return RagDeleteFlush(deleted=deleted, remaining=remaining)
+
+    async def _resume_pending_deletes(self) -> None:
+        """启动时把上次没删成功的 RAG 切片重新排进后台重试。"""
+        try:
+            pending = await asyncio.to_thread(self.delete_queue.items)
+        except Exception as exc:
+            logger.warning("读取 RAG 补删队列失败：%s", exc)
+            return
+        if pending:
+            logger.info("发现 %d 条待补删的 RAG 切片，转后台重试", len(pending))
+            self._schedule_delete_retry()
+
+    def _schedule_delete_retry(self) -> None:
+        """确保补删后台任务在跑；队列清空后它会自己退出。"""
+        if self._delete_retry_task is not None and not self._delete_retry_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # 没有事件循环（同步脚本 / 解释器退出中）：等下次启动再补
+            return
+        self._delete_retry_task = loop.create_task(self._delete_retry(), name="rag-delete-retry")
+
+    async def _delete_retry(self) -> None:
+        while True:
+            await asyncio.sleep(self._delete_retry_seconds)
+            report = await self.flush_pending_deletes()
+            if report.remaining == 0:
+                logger.info("RAG 补删队列已清空")
+                return
 
     async def read_markdown(self, job_id: str) -> MarkdownOut:
         job = await self._require_job(job_id)
@@ -511,6 +677,8 @@ class DocumentService:
         self._check_total(total, len(documents), mode)
 
         report = await asyncio.to_thread(self._write_rag_sync, job.id, documents)
+        # 重新入库 = 这篇文档还在：撤销可能残留的补删标记，别让后台把刚写的新切片删掉。
+        await asyncio.to_thread(self.delete_queue.discard, job.id)
         # RAG 入库状态记在独立的 rag_ingest 上（不覆盖 Chroma 的 ingest），
         # 重复入库时只刷新摘要与时间；写入器会先删掉该文档的旧切片。
         job.rag_ingest = RagIngestInfo(

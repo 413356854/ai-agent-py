@@ -222,8 +222,14 @@ async def download(
     return FileResponse(path, filename=filename, media_type=media_type)
 
 
-@router.delete("/{job_id}", status_code=204, summary="删除任务与结果")
+@router.delete("/{job_id}", status_code=204, summary="删除任务、结果与 RAG 切片")
 async def delete_document(request: Request, job_id: str) -> None:
+    """删除解析任务。
+
+    入过库的文档会同时清掉 Milvus ``rag_chunk`` 里该 ``doc_id`` 的全部切片
+    （删除对称）；Milvus 不可用时只把 ``doc_id`` 记进补删队列并转后台重试，
+    接口仍然返回 204，不会因为向量库故障卡住任务删除。
+    """
     service = get_service(request)
     try:
         deleted = await service.delete(job_id)

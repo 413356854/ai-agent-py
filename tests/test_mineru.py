@@ -16,11 +16,21 @@ import httpx
 import pytest
 
 from ai_agent_py.config import Settings
-from ai_agent_py.errors import DocumentLoadError, MineruAuthError, MineruError, MineruTaskFailed
+from ai_agent_py.errors import (
+    DocumentLoadError,
+    MilvusError,
+    MineruAuthError,
+    MineruError,
+    MineruTaskFailed,
+)
 from ai_agent_py.mineru.archive import extract_result_zip
 from ai_agent_py.mineru.client import MineruClient
-from ai_agent_py.mineru.models import JobState, ParseJob, ParseOptions
+from ai_agent_py.mineru.models import JobState, ParseJob, ParseOptions, RagIngestInfo
 from ai_agent_py.mineru.service import DocumentService, safe_file_name
+from ai_agent_py.offline import OfflineChunkSearcher
+from ai_agent_py.rag.deletions import RagDeleteQueue
+from ai_agent_py.rag.milvus import RagIngestReport
+from ai_agent_py.rag.models import ChunkIn
 from fakes import InMemoryJobStore
 
 MARKDOWN = "# 测试文档\n\n这是一段由 MinerU 解析出来的正文。\n\n![图](images/img0.jpg)\n"
@@ -249,6 +259,8 @@ def service(
     fake: FakeMineru,
     *,
     store: InMemoryJobStore | None = None,
+    delete_queue: RagDeleteQueue | None = None,
+    delete_retry_seconds: float = 3600.0,
     **overrides: Any,
 ) -> DocumentService:
     settings = Settings(
@@ -258,6 +270,7 @@ def service(
         mineru_output_dir=tmp_path / "parsed",
         mineru_poll_interval=0,
         mineru_timeout=5,
+        rag_delete_pending_dir=tmp_path / "rag_delete_pending",
         **overrides,
     )
     return DocumentService(
@@ -266,6 +279,8 @@ def service(
             "test-token", settings.mineru_base_url, client=fake.client()
         ),
         store=store if store is not None else InMemoryJobStore(),
+        delete_queue=delete_queue,
+        delete_retry_seconds=delete_retry_seconds,
     )
 
 
@@ -276,6 +291,19 @@ async def upload(service: DocumentService, payload: bytes, name: str = "demo.pdf
     job = await service.create(name, chunks())
     await service.wait(job.id, timeout=10)
     return job.id
+
+
+async def mark_ingested(store: InMemoryJobStore, job_id: str) -> None:
+    """模拟「已经写入 Milvus rag_chunk」：任务记录带 rag_ingest 摘要。"""
+    job = store.get(job_id)
+    assert job is not None
+    job.rag_ingest = RagIngestInfo(
+        chunks=2,
+        characters=20,
+        collection="db_tax_rag.rag_chunk",
+        ingested_at=datetime.now(UTC),
+    )
+    store.save(job)
 
 
 @pytest.mark.asyncio
@@ -394,6 +422,226 @@ async def test_delete_cancels_in_flight_task_without_resurrecting(
 
     assert store.get(job.id) is None  # 没有被 _fail 的 upsert 写回来
     assert await svc.get(job.id) is None
+    await svc.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_delete_removes_rag_chunks_when_ingested(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """删除对称：入过库的文档删除时要清掉 rag_chunk 里该 doc_id 的全部切片。"""
+    store = InMemoryJobStore()
+    svc = service(tmp_path, FakeMineru(), store=store)
+    job_id = await upload(svc, b"%PDF-1.4 fake")
+    await mark_ingested(store, job_id)
+    calls: list[str] = []
+
+    def fake_delete(self: DocumentService, doc_id: str) -> int:
+        calls.append(doc_id)
+        return 2
+
+    monkeypatch.setattr(DocumentService, "_delete_rag_sync", fake_delete)
+
+    assert await svc.delete(job_id) is True
+    assert calls == [job_id]
+    assert store.get(job_id) is None
+    assert svc.delete_queue.items() == []
+    await svc.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_delete_skips_rag_when_never_ingested(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """没入过库的文档不碰 Milvus：删解析任务不该因为向量库没配置而变慢或报错。"""
+    svc = service(tmp_path, FakeMineru())
+    job_id = await upload(svc, b"%PDF-1.4 fake")
+
+    def unexpected(self: DocumentService, doc_id: str) -> int:
+        raise AssertionError("未入库的文档不应该调用 Milvus 删除")
+
+    monkeypatch.setattr(DocumentService, "_delete_rag_sync", unexpected)
+
+    assert await svc.delete(job_id) is True
+    await svc.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_delete_makes_document_unsearchable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验收：删除文档后检索不到（用离线内存检索器模拟 rag_chunk）。"""
+    from langchain_core.documents import Document
+
+    store = InMemoryJobStore()
+    svc = service(tmp_path, FakeMineru(), store=store)
+    job_id = await upload(svc, b"%PDF-1.4 fake")
+    await mark_ingested(store, job_id)
+
+    searcher = OfflineChunkSearcher()
+    searcher.index_document(job_id, [Document(page_content="住宿费标准：每晚 500 元", metadata={})])
+    assert searcher.search("住宿费标准", k=1)
+
+    def fake_delete(self: DocumentService, doc_id: str) -> int:
+        searcher.delete_document(doc_id)
+        return 1
+
+    monkeypatch.setattr(DocumentService, "_delete_rag_sync", fake_delete)
+
+    assert await svc.delete(job_id) is True
+    assert searcher.search("住宿费标准", k=1) == []
+    await svc.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_delete_is_not_blocked_when_milvus_is_down(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Milvus 不可用：任务照删，doc_id 落进补删队列，等后台重试。"""
+    store = InMemoryJobStore()
+    queue = RagDeleteQueue(tmp_path / "pending")
+    svc = service(tmp_path, FakeMineru(), store=store, delete_queue=queue)
+    job_id = await upload(svc, b"%PDF-1.4 fake")
+    await mark_ingested(store, job_id)
+
+    def boom(self: DocumentService, doc_id: str) -> int:
+        raise MilvusError("Milvus 连接失败")
+
+    monkeypatch.setattr(DocumentService, "_delete_rag_sync", boom)
+
+    assert await svc.delete(job_id) is True
+    assert store.get(job_id) is None
+    assert await svc.get(job_id) is None
+
+    items = queue.items()
+    assert [item.doc_id for item in items] == [job_id]
+    assert items[0].file_name == "demo.pdf"
+    assert items[0].collection == "db_tax_rag.rag_chunk"
+    assert items[0].attempts == 1
+    assert "Milvus" in items[0].last_error
+    await svc.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_delete_survives_unwritable_pending_queue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """补删标记都写不下去时，任务删除仍然成功（只把 doc_id 打进错误日志）。"""
+    store = InMemoryJobStore()
+    svc = service(tmp_path, FakeMineru(), store=store)
+    job_id = await upload(svc, b"%PDF-1.4 fake")
+    await mark_ingested(store, job_id)
+
+    def boom_milvus(self: DocumentService, doc_id: str) -> int:
+        raise MilvusError("Milvus 连接失败")
+
+    def boom_queue(self: RagDeleteQueue, doc_id: str, **kwargs: Any) -> Any:
+        raise OSError("磁盘不可写")
+
+    monkeypatch.setattr(DocumentService, "_delete_rag_sync", boom_milvus)
+    monkeypatch.setattr(RagDeleteQueue, "record", boom_queue)
+
+    assert await svc.delete(job_id) is True
+    assert store.get(job_id) is None
+    await svc.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_pending_delete_retries_until_milvus_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """补删重试：失败累加 attempts 并保留标记，Milvus 恢复后删掉标记。"""
+    store = InMemoryJobStore()
+    queue = RagDeleteQueue(tmp_path / "pending")
+    svc = service(tmp_path, FakeMineru(), store=store, delete_queue=queue)
+    job_id = await upload(svc, b"%PDF-1.4 fake")
+    await mark_ingested(store, job_id)
+
+    def boom(self: DocumentService, doc_id: str) -> int:
+        raise MilvusError("Milvus 连接失败")
+
+    monkeypatch.setattr(DocumentService, "_delete_rag_sync", boom)
+    await svc.delete(job_id)
+    assert queue.items()[0].attempts == 1
+
+    report = await svc.flush_pending_deletes()
+    assert (report.deleted, report.remaining) == (0, 1)
+    assert queue.items()[0].attempts == 2
+
+    calls: list[str] = []
+
+    def recovered(self: DocumentService, doc_id: str) -> int:
+        calls.append(doc_id)
+        return 2
+
+    monkeypatch.setattr(DocumentService, "_delete_rag_sync", recovered)
+    report = await svc.flush_pending_deletes()
+
+    assert (report.deleted, report.remaining) == (1, 0)
+    assert calls == [job_id]
+    assert queue.items() == []
+    await svc.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_reingest_cancels_pending_delete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """文档重新入库 = 它还活着：残留的补删标记必须撤销，否则后台会删掉刚写的新切片。"""
+    store = InMemoryJobStore()
+    queue = RagDeleteQueue(tmp_path / "pending")
+    svc = service(tmp_path, FakeMineru(), store=store, delete_queue=queue)
+    job_id = await upload(svc, b"%PDF-1.4 fake")
+    queue.record(job_id, error="Milvus 连接失败")
+
+    def fake_write(self: DocumentService, doc_id: str, chunks: list[Any]) -> RagIngestReport:
+        return RagIngestReport(
+            chunks=len(chunks),
+            characters=sum(len(chunk.page_content) for chunk in chunks),
+            database="db_tax_rag",
+            collection="rag_chunk",
+        )
+
+    monkeypatch.setattr(DocumentService, "_write_rag_sync", fake_write)
+    await svc.ingest_rag(
+        job_id,
+        chunks=[ChunkIn(content="重新入库的正文", metadata={})],
+        total=1,
+    )
+
+    assert queue.items() == []
+    await svc.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_startup_resumes_pending_deletes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """进程重启后：启动时发现补删标记，后台自动重试，不需要再点一次删除。"""
+    queue = RagDeleteQueue(tmp_path / "pending")
+    queue.record("job-old", file_name="旧文档.pdf", collection="db_tax_rag.rag_chunk", error="x")
+    svc = service(
+        tmp_path,
+        FakeMineru(),
+        delete_queue=queue,
+        delete_retry_seconds=0.02,
+    )
+    calls: list[str] = []
+
+    def fake_delete(self: DocumentService, doc_id: str) -> int:
+        calls.append(doc_id)
+        return 1
+
+    monkeypatch.setattr(DocumentService, "_delete_rag_sync", fake_delete)
+    await svc.ensure_loaded()
+
+    for _ in range(200):
+        await asyncio.sleep(0.01)
+        if not queue.items():
+            break
+
+    assert calls == ["job-old"]
+    assert queue.items() == []
     await svc.shutdown()
 
 

@@ -200,6 +200,11 @@ class Settings(BaseSettings):
     mineru_max_file_mb: int = 200
     mineru_output_dir: Path = PROJECT_ROOT / "data" / "parsed"
 
+    # ---- RAG 切片补删队列（删除对称的兜底）-------------------------------
+    # 删除文档时若 Milvus 不可用，待删的 doc_id 落盘到这里，后台重试；目录里是
+    # 一个 doc_id 一个 JSON 标记，成功一条删一条（见 `rag.deletions`）。
+    rag_delete_pending_dir: Path = PROJECT_ROOT / "data" / "rag_delete_pending"
+
     # ---- 阿里云 OSS（私域图片：管理接口走 access，图片读取走 OSS 直链）----
     # Bucket 是私有的：应用用 AccessKey 在服务端做 V1 签名，前端永远拿不到
     # AccessKey Secret。上传 / 列表 / 删除 / 换取直链要带 access 口令
@@ -477,6 +482,7 @@ class Settings(BaseSettings):
             "mineru": f"{self.mineru_model_version} @ {self.mineru_base_url}",
             "mineru_api_key": _mask(self.resolved_mineru_api_key),
             "mineru_output_dir": str(self.mineru_output_dir),
+            "rag_delete_pending": str(self.rag_delete_pending_dir),
             "mysql": mysql,
             # 数据库口令不做“后四位”提示：短口令会被直接猜出来。
             "mysql_password": "set" if self.mysql_password else "missing",
@@ -522,7 +528,13 @@ class Settings(BaseSettings):
             return None
         return value
 
-    @field_validator("data_dir", "mineru_output_dir", "agent_workspace", mode="after")
+    @field_validator(
+        "data_dir",
+        "mineru_output_dir",
+        "rag_delete_pending_dir",
+        "agent_workspace",
+        mode="after",
+    )
     @classmethod
     def _absolute_path(cls, value: Path) -> Path:
         return value if value.is_absolute() else (PROJECT_ROOT / value)

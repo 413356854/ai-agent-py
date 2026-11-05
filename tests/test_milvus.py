@@ -9,7 +9,7 @@ import pytest
 from langchain_core.documents import Document
 
 from ai_agent_py.config import Settings
-from ai_agent_py.errors import MilvusSchemaError
+from ai_agent_py.errors import MilvusError, MilvusSchemaError
 from ai_agent_py.offline import LexicalHashEmbeddings
 from ai_agent_py.rag.milvus import MilvusRagWriter, chunk_id
 
@@ -34,9 +34,10 @@ class FakeMilvusClient:
         self.operations: list[tuple[str, Any]] = []
         self.flushes = 0
         self.loaded = False
+        self.exists = True
 
     def has_collection(self, name: str) -> bool:
-        return True
+        return self.exists
 
     def describe_collection(self, name: str) -> dict[str, Any]:
         params = {"dim": self.dim} if self.dim else {}
@@ -60,16 +61,18 @@ class FakeMilvusClient:
             {"chunk_id": row["chunk_id"]} for row in self.rows.values() if row["doc_id"] == doc_id
         ][:limit]
 
-    def delete(self, collection: str, *, filter: str) -> None:
+    def delete(self, collection: str, *, filter: str) -> dict[str, int]:
         self.operations.append(("delete", filter))
         doc_match = re.search(r'doc_id == "(.*)"', filter)
         if doc_match:
             doc_id = doc_match.group(1)
+            before = len(self.rows)
             self.rows = {key: row for key, row in self.rows.items() if row["doc_id"] != doc_id}
-            return
-        ids = re.findall(r'"(chunk-[^"]+)"', filter)
-        for value in ids:
-            self.rows.pop(value, None)
+            return {"delete_count": before - len(self.rows)}
+        removed = 0
+        for value in re.findall(r'"(chunk-[^"]+)"', filter):
+            removed += 1 if self.rows.pop(value, None) is not None else 0
+        return {"delete_count": removed}
 
     def upsert(self, collection: str, rows: list[dict[str, Any]]) -> None:
         self.operations.append(("upsert", len(rows)))
@@ -182,6 +185,48 @@ def test_empty_chunks_delete_existing_rows() -> None:
     assert report.chunks == 0
     assert client.rows == {}
     assert client.flushes == 2
+
+
+def test_delete_document_removes_every_chunk_and_flushes() -> None:
+    """删除对称：公开的 delete_document 一次清空该文档，别的文档不受影响。"""
+    writer, client = make_writer()
+    writer.index_document(
+        "doc-1",
+        [
+            Document(page_content="第一块。", metadata={}),
+            Document(page_content="第二块。", metadata={}),
+        ],
+    )
+    writer.index_document("doc-2", [Document(page_content="别的文档。", metadata={})])
+    client.operations.clear()
+    client.flushes = 0
+
+    assert writer.delete_document("doc-1") == 2
+    assert {row["doc_id"] for row in client.rows.values()} == {"doc-2"}
+    assert client.operations == [("delete", 'doc_id == "doc-1"')]
+    assert client.flushes == 1
+
+
+def test_delete_document_skips_missing_collection() -> None:
+    """集合还没建 / 换库后重试补删：没有东西可删，视为删除成功。"""
+    writer, client = make_writer()
+    client.exists = False
+
+    assert writer.delete_document("doc-1") == 0
+    assert client.operations == []
+    assert client.loaded is False
+
+
+def test_delete_document_wraps_milvus_errors() -> None:
+    writer, client = make_writer()
+
+    def boom(collection: str, *, filter: str) -> dict[str, int]:
+        raise RuntimeError("connection refused")
+
+    client.delete = boom  # type: ignore[method-assign]
+
+    with pytest.raises(MilvusError, match="删除 Milvus 切片失败"):
+        writer.delete_document("doc-1")
 
 
 def test_dimension_mismatch_is_rejected() -> None:

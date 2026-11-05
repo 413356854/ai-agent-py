@@ -103,7 +103,8 @@ ai-agent-py/
 │   └── milvus-stop.ps1       # 停止 Milvus（SIGTERM，等待 19530 端口关闭）
 ├── data/
 │   ├── raw/                  # 待索引文档（内置 sample.md）
-│   └── parsed/               # MinerU 解析结果（Markdown + 图片；任务记录在 MySQL）
+│   ├── parsed/               # MinerU 解析结果（Markdown + 图片；任务记录在 MySQL）
+│   └── rag_delete_pending/   # RAG 切片补删队列（删除文档时 Milvus 不可用的兜底）
 ├── src/ai_agent_py/
 │   ├── config.py             # pydantic-settings：全部配置项 + 脱敏描述
 │   ├── llm.py                # 对话模型 / 向量模型工厂（OpenAI 兼容协议）
@@ -124,7 +125,8 @@ ai-agent-py/
 │   │   ├── chunk_cache.py    # 切分结果缓存：split_id → 完整切片（TTL + LRU）
 │   │   ├── filters.py        # 检索过滤条件：类型化 SearchFilter + Milvus 表达式转义
 │   │   ├── citations.py      # 答案引用校验：存在性 / 数字归一化 / 支持度 / citation span
-│   │   ├── milvus.py         # 切分块写入 Milvus rag_chunk（稠密 + BM25，覆盖写）
+│   │   ├── milvus.py         # 切分块写入 Milvus rag_chunk（稠密 + BM25，覆盖写 / 删除）
+│   │   ├── deletions.py      # RAG 切片补删队列：删除文档时 Milvus 不可用的落盘兜底
 │   │   ├── milvus_search.py  # rag_chunk 混合检索（稠密 + BM25 + RRF + 精排，缺 Key 退 BM25）
 │   │   ├── doc_names.py      # 检索后按 doc_id 回查 MySQL 文件名（批量 + 缓存 + 降级）
 │   │   ├── rerank.py         # RRF 之后精排：qwen3.7-text-rerank（DashScope 原生接口）
@@ -134,7 +136,7 @@ ai-agent-py/
 │   │   └── chain.py          # RAG 提示词、LCEL 链、答案与引用
 │   ├── mineru/               # MinerU 精准解析 API 对接
 │   │   ├── client.py         # 异步 httpx：申请上传链接 / PUT / 轮询 / 下载
-│   │   ├── service.py        # 任务调度：上传落盘、进度、结果持久化、入库
+│   │   ├── service.py        # 任务调度：上传落盘、进度、结果持久化、入库、删除（含补删队列）
 │   │   ├── archive.py        # 结果 zip 解包（防 zip slip、图片、页数）
 │   │   └── models.py         # ParseJob / ParseOptions / 状态机
 │   ├── graph/
@@ -163,7 +165,7 @@ ai-agent-py/
 │   └── api/
 │       ├── app.py            # FastAPI：/query /chat /health /info + 前端托管
 │       ├── database.py       # MySQL 健康检查接口：/api/db/health
-│       ├── documents.py      # 文档解析接口：上传 / 状态 / 预览 / 下载 / 切分 / 入库
+│       ├── documents.py      # 文档解析接口：上传 / 状态 / 预览 / 下载 / 切分 / 入库 / 删除
 │       ├── agents.py         # Agent 应用：列表 / 图导出 / 样例 / 试跑
 │       ├── general_agent.py  # 通用 Agent：概览 / MySQL 会话 / 对话（含 SSE 流式）
 │       ├── oss.py            # 私域 OSS：上传 / 列举 / 换取直链 / 删除（access 鉴权）
@@ -260,7 +262,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:8000/query -Method Post `
 | GET | `/api/documents/{id}/download?kind=markdown\|zip\|source` | 下载结果 |
 | GET | `/api/documents/{id}/chunks` | **切分预览**：读 `markdown_file` 切分，返回 `split_id` + 片段与统计 |
 | POST | `/api/documents/{id}/rag` | **按 `split_id` 从缓存取切片写入 Milvus** `db_tax_rag.rag_chunk`（可重复入库：先删旧切片；成功后任务记录 `rag_ingested=true`） |
-| DELETE | `/api/documents/{id}` | 删除任务、结果与源文件 |
+| DELETE | `/api/documents/{id}` | 删除任务、结果、源文件与 `rag_chunk` 切片（Milvus 不可用时转后台补删，仍返回 204） |
 | GET | `/parsed/{id}/images/...` | 解析结果里的图片（Markdown 预览用） |
 | GET | `/api/oss/overview` | **私域 OSS** 配置：Bucket / 目录 / 访问要求 / 大小上限（不含密钥）；同时签发页面会话 Cookie |
 | POST | `/api/oss/images` | **上传图片**（multipart；页面会话或 `X-OSS-Access`）→ `key` + OSS 直链 `url` / `download_url` / `expires_in` |
@@ -299,7 +301,8 @@ Invoke-RestMethod -Uri http://127.0.0.1:8000/query -Method Post `
   多实例部署要么做粘性会话，要么用无状态的 `chunks` 入参。
 - 弹窗最多渲染 5000 个切片；超出时只提示「仅展示前 N 个」，入库仍会写入缓存的全部切片。
 - 前端回传时带上 `total`（切分总数）：与实际入库数量不一致直接 422，避免切分结果错位。
-- 删除任务时会清掉该任务的全部切分缓存。
+- 删除任务时会清掉该任务的全部切分缓存，并**删除 Milvus `rag_chunk` 里该文档的全部切片**
+  （删除对称，见下文「删除文档」）。
 - **重复入库**：每次写 Milvus 前先按 `doc_id` 删除该文档的**全部**旧切片，再 `upsert`
   本次切片；换 `chunk_size` / 修改正文后重新入库不会留下孤儿块或重复块。embedding
   计算成功后才执行删除，向量模型失败不会先丢掉旧数据。
@@ -321,6 +324,18 @@ $env:DASHSCOPE_API_KEY = "sk-..."
 # 3. 启动管理后台：上传 → 切分 → 查阅切片 → 入库 RAG
 uv run ai-agent-py serve --port 8000
 ```
+
+#### 删除文档（删除对称）
+
+- 删除解析任务时，若该文档入过库（`rag_ingest` 非空），会同时调用
+  `MilvusRagWriter.delete_document(doc_id)` 清掉 `rag_chunk` 里它的**全部**切片；
+  向量必须和任务记录一起消失，否则问答还会引用「已删除」的文档。
+- **Milvus 不可用不阻塞删除**：删除失败时把 `doc_id` 落盘到 `RAG_DELETE_PENDING_DIR`
+  （默认 `data/rag_delete_pending/`，一个 doc_id 一个 JSON 标记），接口仍返回 204；
+  后台每 60 秒重试一次，成功一条删一条标记，服务重启后启动时自动续跑。
+- 没入过库的文档不连 Milvus：只有 `rag_ingest` 非空的任务才需要补删。
+- 标记目录与 `data/parsed` 一样是本地运行态资产：多实例共用同一份目录时重复删除是
+  幂等的；将来实例之间不共享磁盘时再换成 Redis / MySQL 队列。
 
 ## RAG 记录与 RAG 问答（Milvus `rag_chunk` + LangGraph）
 
@@ -710,6 +725,8 @@ Invoke-RestMethod http://127.0.0.1:8000/api/db/health
   只有本进程正在解析的任务走内存对象（页数进度比库里更新），避免进度回退。
 - **结果落盘**：`data/parsed/<job_id>/`（`full.md`、`images/`、`mineru.zip`、`source.*`），
   删除任务会一并删除该目录。`.md` / `.json` 不走 MinerU，上传后立刻标记完成。
+- **删除对称**：入过库的文档删除时会同时清掉 `rag_chunk` 里该 `doc_id` 的全部切片；
+  Milvus 不可用时只把 doc_id 记进 `data/rag_delete_pending/` 并转后台重试，删除接口仍返回 204。
 - **入库**：「切分 → 查阅 → 入库 RAG」把服务端缓存的切片写进 Milvus
   `db_tax_rag.rag_chunk`（唯一入库路径）；缺 `DASHSCOPE_API_KEY` / `EMBEDDING_API_KEY`
   时返回 503 并给出提示。本地目录建索引用 `ai-agent-py ingest`，写的是同一张表。
@@ -766,6 +783,7 @@ Invoke-RestMethod "http://127.0.0.1:8000/api/documents/$($job.id)"
 | `MINERU_POLL_INTERVAL` / `MINERU_TIMEOUT` | `3` / `600` | 轮询间隔与单任务最长等待（秒） |
 | `MINERU_MAX_CONCURRENT` / `MINERU_MAX_FILE_MB` | `2` / `200` | 并发解析数与单文件大小上限 |
 | `MINERU_OUTPUT_DIR` | `data/parsed` | 解析产物目录（源文件 / Markdown / 图片 / zip；任务记录在 MySQL） |
+| `RAG_DELETE_PENDING_DIR` | `data/rag_delete_pending` | RAG 切片补删队列：删除文档时 Milvus 不可用的落盘标记（doc_id → JSON），后台重试 |
 | `OSS_BUCKET` / `OSS_ENDPOINT` / `OSS_REGION` | 空 / 空 / `cn-shenzhen` | 私有 Bucket 名与区域 Endpoint（如 `https://oss-cn-shenzhen.aliyuncs.com`） |
 | `OSS_ACCESS_KEY_ID` / `OSS_ACCESS_KEY_SECRET` | 空 | RAM 用户 AccessKey；只在服务端签名 OSS 请求，不返回前端 |
 | `OSS_PREFIX` | `image3` | 只允许读写该目录（对象键 `image3/<年>/<月>/<日>/<uuid>.<后缀>`） |
@@ -1067,7 +1085,7 @@ uv run ai-agent-py db import-jobs             # 写入 tb_document_parse_job
 ## 开发
 
 ```powershell
-uv run pytest            # 384 个测试，全部离线（MinerU / 精排用 httpx.MockTransport，任务记录库用内存 JobStore，RAG 记录 / 问答用假 Milvus 客户端与脚本化模型；检索链路用 offline.OfflineChunkSearcher）
+uv run pytest            # 404 个测试，全部离线（MinerU / 精排用 httpx.MockTransport，任务记录库用内存 JobStore，RAG 记录 / 问答用假 Milvus 客户端与脚本化模型；检索链路用 offline.OfflineChunkSearcher）
 uv run ruff check .      # 静态检查
 uv run ruff format .     # 格式化
 uv run mypy              # 类型检查（src 目录）
@@ -1117,7 +1135,7 @@ uv sync
 
 **数据放在哪里？**
 默认 `data/raw/`，支持子目录递归；也可以 `uv run ai-agent-py ingest D:\docs` 指定任意目录。
-`data/raw/` 与 `data/parsed/` 已在 `.gitignore` 中忽略。
+`data/raw/`、`data/parsed/` 与 `data/rag_delete_pending/` 已在 `.gitignore` 中忽略。
 
 **文档解析提示「Token 无效 / 未配置」？**
 在 `.env` 里填 `MINERU_API_KEY` 后重启服务；页面顶部有黄色提示说明未配置。
@@ -1130,7 +1148,8 @@ uv sync
 **解析结果和任务记录在哪？**
 解析产物在 `data/parsed/<job_id>/`（`full.md`、`images/`、`mineru.zip`、源文件）；
 任务记录在 MySQL 表 `tb_document_parse_job`（一行一个任务，含状态、参数、进度与入库摘要）。
-删除任务会同时删除记录与该目录，服务重启后会继续轮询未完成的任务。
+删除任务会同时删除记录、该目录与 `rag_chunk` 里的切片（补删标记见 `data/rag_delete_pending/`），
+服务重启后会继续轮询未完成的任务。
 
 **管理后台打不开？**
 先构建一次前端：`cd web && pnpm install && pnpm build`，再重启 `serve`；未构建时打开 `/` 会提示构建命令。
