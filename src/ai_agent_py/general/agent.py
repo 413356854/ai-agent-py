@@ -195,6 +195,7 @@ def build_general_agent_graph(
     tool_node = build_tool_node(
         tool_list,
         result_formatter=lambda text: clip_tool_result(text, cfg),
+        settings=cfg,
     )
 
     builder = StateGraph(GeneralAgentState)

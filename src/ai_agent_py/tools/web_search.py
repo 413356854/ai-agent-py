@@ -16,6 +16,7 @@ from typing import Any
 
 import httpx
 from langchain_core.tools import BaseTool, tool
+from pydantic import BaseModel, Field
 
 from ai_agent_py.config import Settings, get_settings
 from ai_agent_py.errors import ToolError
@@ -26,6 +27,13 @@ WEB_SEARCH_TOOL_DESCRIPTION = (
     "返回基于网页结果的摘要和来源链接，摘要里的 [ref_n] 角标与来源列表一一对应。"
     "知识库没有、且需要最新信息时使用；query 用一句自然语言说明要查什么，一次只查一件事。"
 )
+
+
+class WebSearchArgs(BaseModel):
+    """``web_search`` 的入参。"""
+
+    query: str = Field(min_length=1, description="要查询的内容（一句自然语言）")
+
 
 DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/api/v1"
 DEFAULT_MODEL = "qwen-plus"
@@ -272,7 +280,7 @@ def build_web_search_tool(
         timeout=cfg.web_search_timeout,
     )
 
-    @tool(WEB_SEARCH_TOOL_NAME, description=WEB_SEARCH_TOOL_DESCRIPTION)
+    @tool(WEB_SEARCH_TOOL_NAME, description=WEB_SEARCH_TOOL_DESCRIPTION, args_schema=WebSearchArgs)
     def web_search(query: str) -> str:
         """通过百炼联网搜索查询实时网页信息。"""
         try:

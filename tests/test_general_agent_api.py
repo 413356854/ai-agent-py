@@ -163,6 +163,15 @@ def test_overview_lists_all_tools_and_memory(monkeypatch, tmp_path: Path) -> Non
     assert body["workspace"] == str(tmp_path)
     assert [tool["name"] for tool in body["tools"]] == EXPECTED_TOOLS
     assert body["tools"][0]["group_label"] == "知识库"
+    # A-01：工具策略随概览暴露（超时 / 重试 / 风险 / 并行）。
+    assert body["tools"][0]["timeout_seconds"] == 60.0
+    assert body["tools"][0]["retryable"] is True
+    assert body["tools"][0]["risk_level"] == "low"
+    shell = next(tool for tool in body["tools"] if tool["name"] == "shell")
+    assert shell["timeout_seconds"] is None
+    assert shell["risk_level"] == "high"
+    assert shell["concurrent"] is False
+    assert body["shell_enabled"] is True
     assert body["memory"] == {
         "configured": True,
         "ok": True,
@@ -205,6 +214,18 @@ def test_overview_reports_memory_failure(monkeypatch, tmp_path: Path) -> None:
     assert body["memory"]["ok"] is False
     assert "MySQL" in body["memory"]["error"]
     assert any("会话记忆不可用" in warning for warning in body["warnings"])
+
+
+def test_overview_shell_flag_follows_tool_list(monkeypatch, tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    client, _, _ = make_client(monkeypatch, tmp_path, settings=settings)
+    tools = build_general_tools(settings, searcher=FakeSearcher(), include_shell=False)
+    monkeypatch.setattr(api_general, "_tools", lambda: tools)
+
+    body = client.get("/api/general-agent/overview").json()
+
+    assert body["shell_enabled"] is False
+    assert "shell" not in [tool["name"] for tool in body["tools"]]
 
 
 # ---- /sessions ------------------------------------------------------------
@@ -397,6 +418,8 @@ def test_chat_records_tool_calls(monkeypatch, tmp_path: Path) -> None:
     assert tool_row["role"] == "tool"
     assert tool_row["tool_name"] == "read"
     assert tool_row["tool_status"] == "ok"
+    # 同步路径从工具节点的 artifact 读取真实耗时（A-01）。
+    assert tool_row["elapsed_ms"] is not None
     assert json.loads(tool_row["tool_args"]) == {"path": "notes.md"}
     assert "差旅住宿按城市分级" in tool_row["content"]
     assert answer_row["role"] == "assistant"

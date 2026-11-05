@@ -104,11 +104,19 @@ def test_agent_tool_settings() -> None:
     assert cfg.resolved_web_search_api_key is None
     assert cfg.web_extractor_timeout > 0
     assert cfg.web_extractor_max_chars > 0
+    assert cfg.agent_tool_timeout > 0
+    assert cfg.agent_tool_retries >= 0
+    assert cfg.agent_tool_parallel is True
+    assert "timeout=60s" in cfg.describe()["agent_tools"]
 
     with pytest.raises(ValidationError):
         Settings(_env_file=None, agent_shell_timeout=0)
     with pytest.raises(ValidationError):
         Settings(_env_file=None, agent_shell_max_output=0)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, agent_tool_timeout=0)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, agent_tool_retries=-1)
     with pytest.raises(ValidationError):
         Settings(_env_file=None, web_search_timeout=0)
     with pytest.raises(ValidationError):

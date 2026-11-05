@@ -73,7 +73,30 @@ function splitImageMarkdown(content: string): { text: string; images: string[] }
   return { text, images }
 }
 
-type ToolStatus = 'running' | 'ok' | 'error'
+type ToolStatus = 'running' | 'ok' | 'error' | 'timeout'
+
+/** 工具状态：后端返回 ok / error / timeout / invalid_args，这里归并成展示用的三态。 */
+function toolStatus(raw: string | null | undefined): ToolStatus {
+  if (raw === 'timeout') return 'timeout'
+  if (raw && raw !== 'ok') return 'error'
+  return 'ok'
+}
+
+const TOOL_RISK_LABELS: Record<string, string> = {
+  low: '低风险',
+  medium: '中风险',
+  high: '高风险',
+}
+
+/** 工具策略的一行摘要（超时 / 重试 / 风险 / 并行）。 */
+function policySummary(tool: GeneralAgentTool): string {
+  const timeout =
+    tool.timeout_seconds == null ? '超时由工具自身控制' : `超时 ${tool.timeout_seconds}s`
+  const retry = tool.retryable ? `可重试 ${tool.max_retries ?? 1} 次` : '不重试'
+  const risk = TOOL_RISK_LABELS[tool.risk_level ?? 'low'] ?? tool.risk_level ?? '低风险'
+  const concurrency = tool.concurrent === false ? '串行' : '可并行'
+  return `${timeout} · ${retry} · ${risk} · ${concurrency}`
+}
 
 interface ToolTrace {
   id: string
@@ -171,7 +194,7 @@ function toItems(messages: AgentChatMessage[], includeCompressed = false): ChatI
             id: message.tool_call_id ?? `tool-${key}`,
             name: message.tool_name ?? 'tool',
             args: message.tool_args,
-            status: message.tool_status === 'error' ? 'error' : 'ok',
+            status: toolStatus(message.tool_status),
             result: message.content,
             elapsedMs: message.elapsed_ms,
           },
@@ -194,12 +217,15 @@ const ToolCard = memo(function ToolCard({ tool }: { tool: ToolTrace }) {
   const status =
     tool.status === 'running'
       ? { color: 'processing', label: '执行中' }
-      : tool.status === 'error'
-        ? { color: 'red', label: '失败' }
-        : { color: 'green', label: '完成' }
+      : tool.status === 'timeout'
+        ? { color: 'orange', label: '超时' }
+        : tool.status === 'error'
+          ? { color: 'red', label: '失败' }
+          : { color: 'green', label: '完成' }
+  const failed = tool.status === 'error' || tool.status === 'timeout'
 
   return (
-    <div className={`agent-tool-card${tool.status === 'error' ? ' agent-tool-card-error' : ''}`}>
+    <div className={`agent-tool-card${failed ? ' agent-tool-card-error' : ''}`}>
       <Space size={6} wrap>
         <Tag color="geekblue" icon={<ToolOutlined />}>
           {tool.name}
@@ -676,7 +702,7 @@ export function GeneralAgentPage() {
               tool.id === result.id
                 ? {
                     ...tool,
-                    status: result.status === 'error' ? 'error' : 'ok',
+                    status: toolStatus(result.status),
                     result: result.content,
                     elapsedMs: result.elapsed_ms,
                   }
@@ -1139,6 +1165,9 @@ export function GeneralAgentPage() {
                       <div key={tool.name} className="agent-tool-doc">
                         <Tag color="geekblue">{tool.name}</Tag>
                         <div className="agent-tool-doc-desc">{tool.description}</div>
+                        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                          {policySummary(tool)}
+                        </Typography.Text>
                       </div>
                     ))}
                   </Space>

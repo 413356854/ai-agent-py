@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from langchain_core.tools import BaseTool, tool
+from pydantic import BaseModel, Field
 
 from ai_agent_py.config import Settings, get_settings
 from ai_agent_py.errors import ToolError
@@ -25,6 +26,20 @@ SHELL_TOOL_NAME = "shell"
 DEFAULT_TIMEOUT = 120.0
 MAX_TIMEOUT = 3600.0
 DEFAULT_MAX_OUTPUT = 20_000
+
+
+class ShellArgs(BaseModel):
+    """``shell`` 的入参；``timeout`` 上限与工具内部一致（``MAX_TIMEOUT``）。"""
+
+    command: str = Field(min_length=1, description="要执行的 shell 命令")
+    timeout: float | None = Field(
+        default=None,
+        gt=0,
+        le=MAX_TIMEOUT,
+        description=f"超时秒数（默认 AGENT_SHELL_TIMEOUT，上限 {MAX_TIMEOUT:g}）",
+    )
+    cwd: str = Field(default=".", description="工作目录内的子目录")
+
 
 SHELL_DESCRIPTION = (
     "在工作目录内执行 shell 命令（Windows 优先 pwsh，其次 powershell / cmd；"
@@ -187,7 +202,7 @@ def build_shell_tool(
     default_timeout = cfg.agent_shell_timeout
     max_output = cfg.agent_shell_max_output
 
-    @tool(SHELL_TOOL_NAME, description=SHELL_DESCRIPTION)
+    @tool(SHELL_TOOL_NAME, description=SHELL_DESCRIPTION, args_schema=ShellArgs)
     def shell(command: str, timeout: float | None = None, cwd: str = ".") -> str:
         """在工作目录内执行 shell 命令，返回输出与退出码。"""
         try:

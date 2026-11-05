@@ -80,7 +80,7 @@ def build_agent_graph(
 
     builder = StateGraph(AgentState)
     _add_node(builder, "agent", build_agent_node(model, tool_list, system_prompt=system_prompt))
-    _add_node(builder, "tools", build_tool_node(tool_list))
+    _add_node(builder, "tools", build_tool_node(tool_list, settings=cfg))
     builder.add_edge(START, "agent")
     builder.add_conditional_edges("agent", route_after_agent, {"tools": "tools", "end": END})
     builder.add_edge("tools", "agent")

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from langchain_core.tools import BaseTool, tool
+from pydantic import BaseModel, Field
 
 from ai_agent_py.config import Settings
 from ai_agent_py.rag.chain import format_documents
@@ -34,6 +35,7 @@ if TYPE_CHECKING:
 __all__ = [
     "KNOWLEDGE_TOOL_DESCRIPTION",
     "KNOWLEDGE_TOOL_NAME",
+    "KnowledgeSearchArgs",
     "build_filesystem_tools",
     "build_knowledge_tool",
     "build_shell_tool",
@@ -50,6 +52,16 @@ KNOWLEDGE_TOOL_DESCRIPTION = (
 )
 
 
+class KnowledgeSearchArgs(BaseModel):
+    """``search_knowledge_base`` 的入参。"""
+
+    query: str = Field(min_length=1, description="检索问题或关键词")
+    doc_ids: list[str] | None = Field(
+        default=None,
+        description="只在这些文档 id 内检索；不传则使用工具默认范围（未配置时全库）",
+    )
+
+
 def build_knowledge_tool(
     searcher: DocumentSearcher,
     *,
@@ -64,7 +76,7 @@ def build_knowledge_tool(
     """
     default_filter = SearchFilter.from_doc_ids(default_doc_ids)
 
-    @tool(name, description=description)
+    @tool(name, description=description, args_schema=KnowledgeSearchArgs)
     def search_knowledge_base(query: str, doc_ids: list[str] | None = None) -> str:
         """在内部知识库中检索与 query 相关的文档片段。
 

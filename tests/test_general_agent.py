@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any
 
 from langchain_core.documents import Document
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.tools import tool
 
 from ai_agent_py.config import Settings
 from ai_agent_py.general.agent import (
@@ -124,8 +126,8 @@ def test_general_graph_runs_tool_calls_and_answers(tmp_path: Path) -> None:
     system = model.received[0][0]
     assert isinstance(system, SystemMessage)
     assert system.content == GENERAL_AGENT_SYSTEM_PROMPT
-    for tool in tools:
-        assert tool.name in system.content
+    for item in tools:
+        assert item.name in system.content
 
 
 def test_general_graph_can_read_workspace_files(tmp_path: Path) -> None:
@@ -149,6 +151,32 @@ def test_general_graph_can_read_workspace_files(tmp_path: Path) -> None:
     assert "差旅住宿按城市分级" in tool_message.content
     assert "1→# 笔记" in tool_message.content
     assert result["messages"][-1].content == "文件里写着：差旅住宿按城市分级。"
+
+
+def test_graph_survives_a_stuck_tool(tmp_path: Path) -> None:
+    """工具卡住时按策略超时，图继续走到最终回答（A-01 验收）。"""
+
+    @tool("slow", description="永远跑不完的假工具")
+    def slow() -> str:
+        """Sleep much longer than the policy timeout."""
+        time.sleep(3)
+        return "late"
+
+    model = ScriptedChatModel(
+        responses=[
+            tool_call_message("slow", {}),
+            AIMessage(content="工具超时了，我改用其他办法。"),
+        ]
+    )
+    settings = make_settings(tmp_path, agent_tool_timeout=0.2)
+    graph = build_general_agent_graph(llm=model, tools=[slow], settings=settings)
+
+    result = graph.invoke({"messages": [HumanMessage(content="跑一下 slow")]})
+
+    tool_message = result["messages"][2]
+    assert "工具执行超时" in tool_message.content
+    assert tool_message.artifact["status"] == "timeout"
+    assert result["messages"][-1].content == "工具超时了，我改用其他办法。"
 
 
 def test_tool_result_is_clipped_for_model_but_kept_in_artifact(tmp_path: Path) -> None:

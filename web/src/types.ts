@@ -441,6 +441,15 @@ export interface GeneralAgentTool {
   group: string
   group_label: string
   description: string
+  /** 单次调用超时（秒）；null 表示由工具自身控制（shell 的命令超时）。 */
+  timeout_seconds?: number | null
+  /** 临时失败（网络 / 429 / 5xx）是否自动重试。 */
+  retryable?: boolean
+  max_retries?: number
+  /** low / medium / high。 */
+  risk_level?: string
+  /** 同一轮是否与其他工具并行执行。 */
+  concurrent?: boolean
 }
 
 /** MySQL 会话记忆状态（表是否可读写、历史窗口、会话数）。 */

@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from langchain_core.tools import BaseTool, tool
+from pydantic import BaseModel, Field
 
 from ai_agent_py.config import Settings
 from ai_agent_py.errors import ToolError
@@ -66,6 +67,66 @@ DEFAULT_GLOB_RESULTS = 200
 DEFAULT_GREP_RESULTS = 250
 MAX_SCAN_MATCHES = 10_000
 MAX_READ_LINES = 5_000
+
+
+# ---- 入参 schema ----------------------------------------------------------
+# 显式 Pydantic schema 让 `bind_tools` 生成的 JSON Schema 带上 enum / min / max，
+# 模型第一次就能给出合法参数；越界或类型错误会由工具节点转成可纠正的中文提示。
+class ReadArgs(BaseModel):
+    """``read`` 的入参。"""
+
+    path: str = Field(min_length=1, description="工作目录内的相对路径")
+    offset: int = Field(default=1, ge=1, description="起始行号（从 1 开始）")
+    limit: int = Field(
+        default=2000,
+        ge=1,
+        le=MAX_READ_LINES,
+        description=f"本次最多返回行数（上限 {MAX_READ_LINES}）",
+    )
+
+
+class WriteArgs(BaseModel):
+    """``write`` 的入参。"""
+
+    path: str = Field(min_length=1, description="工作目录内的相对路径")
+    content: str = Field(description="完整文件内容（UTF-8，换行原样保留）")
+
+
+class EditArgs(BaseModel):
+    """``edit`` 的入参。"""
+
+    path: str = Field(min_length=1, description="工作目录内的相对路径")
+    old_string: str = Field(min_length=1, description="要替换的原文片段（必须完全一致）")
+    new_string: str = Field(description="替换后的内容")
+    replace_all: bool = Field(default=False, description="是否替换所有出现位置")
+
+
+class GlobArgs(BaseModel):
+    """``glob`` 的入参。"""
+
+    pattern: str = Field(min_length=1, description="glob 模式，如 *.py 或 src/**/*.py")
+    path: str = Field(default=".", description="搜索目录（工作目录内的相对路径）")
+    max_results: int = Field(
+        default=DEFAULT_GLOB_RESULTS,
+        ge=1,
+        le=MAX_RESULTS,
+        description=f"最多返回文件数（上限 {MAX_RESULTS}）",
+    )
+
+
+class GrepArgs(BaseModel):
+    """``grep`` 的入参。"""
+
+    pattern: str = Field(min_length=1, description="Python 正则表达式")
+    path: str = Field(default=".", description="搜索目录（工作目录内的相对路径）")
+    include: str | None = Field(default=None, description="只搜索匹配该 glob 的文件，如 *.py")
+    ignore_case: bool = Field(default=False, description="是否忽略大小写")
+    max_results: int = Field(
+        default=DEFAULT_GREP_RESULTS,
+        ge=1,
+        le=MAX_RESULTS,
+        description=f"最多返回匹配行数（上限 {MAX_RESULTS}）",
+    )
 
 
 @dataclass(frozen=True)
@@ -410,17 +471,17 @@ def build_filesystem_tools(
     """
     root = resolve_workspace(workspace, settings)
 
-    @tool(READ_TOOL_NAME, description=READ_DESCRIPTION)
+    @tool(READ_TOOL_NAME, description=READ_DESCRIPTION, args_schema=ReadArgs)
     def read(path: str, offset: int = 1, limit: int = 2000) -> str:
         """读取工作目录内的文本文件，返回带行号的内容。"""
         return _guard(lambda: read_file(root, path, offset=offset, limit=limit))
 
-    @tool(WRITE_TOOL_NAME, description=WRITE_DESCRIPTION)
+    @tool(WRITE_TOOL_NAME, description=WRITE_DESCRIPTION, args_schema=WriteArgs)
     def write(path: str, content: str) -> str:
         """把完整内容写入工作目录内的文件（不存在则创建，存在则覆盖）。"""
         return _guard(lambda: write_file(root, path, content))
 
-    @tool(EDIT_TOOL_NAME, description=EDIT_DESCRIPTION)
+    @tool(EDIT_TOOL_NAME, description=EDIT_DESCRIPTION, args_schema=EditArgs)
     def edit(
         path: str,
         old_string: str,
@@ -430,12 +491,12 @@ def build_filesystem_tools(
         """在文件中把 old_string 精确替换为 new_string。"""
         return _guard(lambda: edit_file(root, path, old_string, new_string, replace_all))
 
-    @tool(GLOB_TOOL_NAME, description=GLOB_DESCRIPTION)
+    @tool(GLOB_TOOL_NAME, description=GLOB_DESCRIPTION, args_schema=GlobArgs)
     def glob(pattern: str, path: str = ".", max_results: int = DEFAULT_GLOB_RESULTS) -> str:
         """按 glob 模式查找工作目录内的文件。"""
         return _guard(lambda: glob_files(root, pattern, path, max_results))
 
-    @tool(GREP_TOOL_NAME, description=GREP_DESCRIPTION)
+    @tool(GREP_TOOL_NAME, description=GREP_DESCRIPTION, args_schema=GrepArgs)
     def grep(
         pattern: str,
         path: str = ".",

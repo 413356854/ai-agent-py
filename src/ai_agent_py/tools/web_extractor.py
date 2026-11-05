@@ -18,6 +18,7 @@ from urllib.parse import urlsplit
 
 import httpx
 from langchain_core.tools import BaseTool, tool
+from pydantic import BaseModel, Field
 
 from ai_agent_py.config import Settings, get_settings
 from ai_agent_py.errors import ToolError
@@ -28,6 +29,13 @@ WEB_EXTRACT_TOOL_DESCRIPTION = (
     "用本工具阅读页面详情；返回页面主要内容，过长会自动截断。"
     "url 必须是完整的 http/https 地址；只抓取单页，不跟随站内链接。"
 )
+
+
+class WebExtractArgs(BaseModel):
+    """``web_extract`` 的入参。"""
+
+    url: str = Field(min_length=1, description="完整的 http/https 页面地址")
+
 
 DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_TIMEOUT = 120.0
@@ -257,7 +265,11 @@ def build_web_extractor_tool(
         max_chars=cfg.web_extractor_max_chars,
     )
 
-    @tool(WEB_EXTRACT_TOOL_NAME, description=WEB_EXTRACT_TOOL_DESCRIPTION)
+    @tool(
+        WEB_EXTRACT_TOOL_NAME,
+        description=WEB_EXTRACT_TOOL_DESCRIPTION,
+        args_schema=WebExtractArgs,
+    )
     def web_extract(url: str) -> str:
         """用百炼 web_extractor 抓取指定网页的正文。"""
         try:

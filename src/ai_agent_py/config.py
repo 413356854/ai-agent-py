@@ -64,6 +64,13 @@ class Settings(BaseSettings):
     agent_shell_timeout: float = 120.0
     # shell 的 stdout / stderr 各自保留的最大字符数，超出按头尾截断。
     agent_shell_max_output: int = 20000
+    # ---- 工具调用策略（tools/policy.py；所有工具统一生效）------------------
+    # 单次工具调用的硬超时（秒）。shell 例外：它的截止时间由命令参数控制。
+    agent_tool_timeout: float = 60.0
+    # 可重试工具（知识库检索 / 联网搜索 / 网页抓取）遇到网络、429、5xx 时的重试次数。
+    agent_tool_retries: int = 1
+    # 同一轮多个工具调用是否并行；write / edit / shell 始终串行。
+    agent_tool_parallel: bool = True
 
     # ---- 通用 agent 的会话记忆（MySQL tb_agent_chat_session / tb_agent_chat_message）----
     # 会话列表默认返回条数；历史候选池见下方 AGENT_MEMORY_CANDIDATES。
@@ -446,6 +453,10 @@ class Settings(BaseSettings):
             "agent_shell": (
                 f"timeout={self.agent_shell_timeout:g}s, max_output={self.agent_shell_max_output}"
             ),
+            "agent_tools": (
+                f"timeout={self.agent_tool_timeout:g}s, retries={self.agent_tool_retries}, "
+                f"parallel={'on' if self.agent_tool_parallel else 'off'}"
+            ),
             "agent_memory": (
                 f"mysql, candidates={self.agent_memory_candidates}, "
                 f"sessions={self.agent_memory_sessions}"
@@ -692,6 +703,20 @@ class Settings(BaseSettings):
     def _positive_shell_output(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("AGENT_SHELL_MAX_OUTPUT 必须是正整数")
+        return value
+
+    @field_validator("agent_tool_timeout", mode="after")
+    @classmethod
+    def _positive_tool_timeout(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("AGENT_TOOL_TIMEOUT 必须是正数")
+        return value
+
+    @field_validator("agent_tool_retries", mode="after")
+    @classmethod
+    def _non_negative_tool_retries(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("AGENT_TOOL_RETRIES 不能为负数")
         return value
 
     @field_validator("agent_memory_sessions", mode="after")

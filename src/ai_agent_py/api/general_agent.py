@@ -73,6 +73,8 @@ from ai_agent_py.general.context import (
 from ai_agent_py.general.summary import SummaryError, summarize_history
 from ai_agent_py.graph.agent import agent_config, message_text
 from ai_agent_py.llm import get_chat_model
+from ai_agent_py.tools.policy import ToolPolicies
+from ai_agent_py.tools.shell import SHELL_TOOL_NAME
 
 if TYPE_CHECKING:
     from langchain_core.tools import BaseTool
@@ -143,6 +145,14 @@ class ToolOut(BaseModel):
     group: str
     group_label: str
     description: str
+    timeout_seconds: float | None = Field(
+        default=None,
+        description="单次调用超时（秒）；null 表示由工具自身控制（shell 的命令超时）",
+    )
+    retryable: bool = Field(default=False, description="临时失败是否自动重试")
+    max_retries: int = Field(default=0, description="最多重试次数")
+    risk_level: str = Field(default="low", description="low / medium / high")
+    concurrent: bool = Field(default=True, description="同一轮是否与其他工具并行执行")
 
 
 class ContextConfigOut(BaseModel):
@@ -383,21 +393,24 @@ def overview() -> OverviewOut:
         summary_max_chars=cfg.agent_summary_max_chars,
         overflow_retries=cfg.agent_context_overflow_retries,
     )
+    policies = ToolPolicies.from_settings(cfg)
+    metas = describe_tools(tools)
     return OverviewOut(
         ready=llm_configured and memory.ok,
         llm_model=cfg.general_agent_model or cfg.llm_model,
         llm_configured=llm_configured,
         max_turns=cfg.agent_max_turns,
         workspace=str(cfg.agent_workspace),
-        shell_enabled=True,
+        shell_enabled=any(tool.name == SHELL_TOOL_NAME for tool in tools),
         tools=[
             ToolOut(
                 name=item.name,
                 group=item.group,
                 group_label=item.group_label,
                 description=item.description,
+                **policies.describe(item.name),
             )
-            for item in describe_tools(tools)
+            for item in metas
         ],
         memory=memory,
         context=context,
@@ -749,14 +762,16 @@ def _stream_events(
                                 emitted = True
                                 info = call_meta.get(item.tool_call_id, {})
                                 content = _clip_tool_result(_tool_output(item))
-                                status = _tool_status(content)
-                                elapsed = round(
-                                    (
-                                        time.perf_counter()
-                                        - tool_started.get(item.tool_call_id, started)
+                                status = _tool_status(content, item)
+                                elapsed = _tool_elapsed(item)
+                                if elapsed is None:
+                                    elapsed = round(
+                                        (
+                                            time.perf_counter()
+                                            - tool_started.get(item.tool_call_id, started)
+                                        )
+                                        * 1000
                                     )
-                                    * 1000
-                                )
                                 name = str(info.get("name") or item.name or "tool")
                                 tool_rows.append(
                                     ChatMessage(
@@ -1119,7 +1134,8 @@ def _collect_turn(messages: Sequence[AnyMessage]) -> tuple[str, list[ChatMessage
                     tool_name=str(info.get("name") or message.name or "tool"),
                     tool_call_id=message.tool_call_id,
                     tool_args=_dump_args(info.get("args")),
-                    tool_status=_tool_status(content),
+                    tool_status=_tool_status(content, message),
+                    elapsed_ms=_tool_elapsed(message),
                 )
             )
 
@@ -1179,9 +1195,34 @@ def _dump_args(args: Any) -> str | None:
     return text if len(text) <= MAX_TOOL_ARGS_CHARS else f"{text[:MAX_TOOL_ARGS_CHARS]}…"
 
 
-def _tool_status(content: str) -> str:
+def _tool_elapsed(message: ToolMessage) -> int | None:
+    """工具节点写入的真实耗时（毫秒）；老消息没有 artifact 时返回 None。"""
+    artifact = getattr(message, "artifact", None)
+    if isinstance(artifact, dict):
+        value = artifact.get("elapsed_ms")
+        if isinstance(value, (int, float)):
+            return int(value)
+    return None
+
+
+def _tool_status(content: str, message: ToolMessage | None = None) -> str:
+    """工具状态：优先取工具节点的 artifact（ok / error / timeout / invalid_args）。"""
+    if message is not None:
+        artifact = getattr(message, "artifact", None)
+        if isinstance(artifact, dict):
+            status = artifact.get("status")
+            if isinstance(status, str) and status:
+                return status
     head = content.lstrip()
-    if head.startswith(("错误：", "工具执行失败", "未知工具")):
+    if head.startswith(
+        (
+            "错误：",
+            "工具执行失败",
+            "未知工具",
+            "工具执行超时",
+            "工具参数不合法",
+        )
+    ):
         return "error"
     return "ok"
 

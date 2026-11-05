@@ -88,6 +88,11 @@
   会自动转换为 provider 原生的 `image_url`），**通用 Agent 使用 `GENERAL_AGENT_MODEL`**
   （留空跟随 `LLM_MODEL`），接收图片时需要支持视觉的模型（如 `qwen3-vl-plus`）；
   历史回放时同样会把图片链接还原成 image 块。
+- **工具层标准化（A-01）**：所有工具调用统一走 `tools/policy.py` 的 `ToolPolicy` 注册表——
+  单次调用超时（守护线程执行，卡住的工具返回「执行超时」而不是挂住整张图）、临时失败重试
+  （网络 / 429 / 5xx）、同一轮多个 `tool_calls` 并行（`write` / `edit` / `shell` 保持串行）、
+  显式 Pydantic `args_schema`（越界参数返回可纠正的中文提示）。每次调用把 `status` /
+  `error_code` / `elapsed_ms` / `attempts` 写进 `ToolMessage.artifact`，接口与 MySQL 工具行直接复用。
 - **中文友好**：分块规则针对中文标点调优，提示词与 CLI / 前端输出均为中文。
 
 ## 目录结构
@@ -773,6 +778,7 @@ Invoke-RestMethod "http://127.0.0.1:8000/api/documents/$($job.id)"
 | `AGENT_SUMMARY_MAX_TOKENS` / `AGENT_SUMMARY_INPUT_MAX_CHARS` | `1200` / `30000` | 摘要模型输出上限、送进摘要模型的对话文本上限 |
 | `AGENT_CONTEXT_OVERFLOW_RETRIES` | `1` | 上下文超限后的强制压缩重试次数 |
 | `AGENT_WORKSPACE` / `AGENT_SHELL_TIMEOUT` / `AGENT_SHELL_MAX_OUTPUT` | 项目根目录 / `120` / `20000` | 文件工具与 shell 的工作目录边界、命令超时（秒）、单路输出上限（字符） |
+| `AGENT_TOOL_TIMEOUT` / `AGENT_TOOL_RETRIES` / `AGENT_TOOL_PARALLEL` | `60` / `1` / `true` | 工具调用策略：单次硬超时（秒，shell 由命令参数控制）、可重试工具的最大重试次数、同一轮是否并行 |
 | `WEB_SEARCH_API_KEY` / `WEB_SEARCH_MODEL` / `WEB_SEARCH_STRATEGY` | 空（回退 `DASHSCOPE_API_KEY`） / `qwen-plus` / 空 | 联网搜索 Key、模型与策略（留空 = 服务端默认 turbo） |
 | `WEB_EXTRACTOR_MODEL` / `WEB_EXTRACTOR_MAX_CHARS` | 跟随 `LLM_MODEL` / `20000` | 网页抓取模型与正文上限；Base URL / Key 留空跟随 LLM |
 | `MINERU_API_KEY` | 空 | MinerU Token（[申请](https://mineru.net/apiManage/token)），文档解析必需 |
@@ -870,7 +876,8 @@ START ──▶ agent ──有 tool_calls？──是──▶ tools
 - `recursion_limit` 由 `AGENT_MAX_TURNS` 换算，防止无限循环。
 - 需要多轮记忆时传入 `checkpointer=InMemorySaver()`（CLI 的 `chat` 与 API 的 `/chat` 已内置）。
 
-新增工具只需在 `tools/__init__.py` 里加函数，再 `build_agent_graph(tools=[...])`，图本身不用改。
+新增工具只需在 `tools/__init__.py` 里加函数，再 `build_agent_graph(tools=[...])`，图本身不用改；
+需要专属超时 / 重试 / 并行策略时在 `tools/policy.py` 的 `ToolPolicies` 里登记。
 
 #### 通用工具（`tools/workspace.py` / `filesystem.py` / `shell.py` / `web_search.py` / `web_extractor.py`）
 
@@ -923,6 +930,28 @@ graph = build_agent_graph(tools=tools)
   `WEB_EXTRACTOR_MAX_CHARS`；响应里没有 `web_extractor_call` 时会明确提示「内容可能不是页面正文」。
 - 工作目录内的文件（包括 `.env`）对模型可读，**敏感信息不要放进 `AGENT_WORKSPACE`**。
 - 这组工具默认不挂到知识库问答图上（那套提示词只认检索工具），需要时按上面的方式显式传入。
+
+#### 工具调用策略（`tools/policy.py` + `graph/nodes.py`）
+
+`build_tool_node` 是唯一执行工具的地方，每次调用都按注册表里的 `ToolPolicy` 执行：
+
+| 策略 | 默认 | 行为 |
+| --- | --- | --- |
+| `timeout` | 60s（shell 为 `None`） | 在守护线程里跑，超时返回「工具执行超时」；shell 由命令的 `timeout` 参数控制 |
+| `retryable` / `max_retries` | 检索 / 联网工具开启，1 次 | 只重试网络、429、5xx 与超时类 `错误：...`；参数错误与普通失败不重试 |
+| `concurrent` | 读类工具并行，`write` / `edit` / `shell` 串行 | 同一轮的多个 `tool_calls` 一起跑，结果仍按调用顺序回填 |
+| `max_output_chars` | 200k | 兜底截断 `artifact['raw']`，避免 `read` 极端输出整段进内存 / MySQL |
+| `risk_level` | low / medium / high | 仅展示与排查用，见 `GET /api/general-agent/overview` 的 `tools[]` |
+
+- 参数用显式 Pydantic schema（`ReadArgs` / `ShellArgs` / `KnowledgeSearchArgs` …），
+  `bind_tools` 生成的 JSON Schema 自带 `minimum` / `maximum` / `minLength`；越界时模型收到
+  `工具参数不合法（read）：limit: Input should be less than or equal to 5000…，请对照工具说明修正参数`。
+- 每个 `ToolMessage.artifact` 都带 `status`（ok / error / timeout / invalid_args）、`error_code`、
+  `elapsed_ms`、`attempts`、`raw`、`raw_chars`；通用 Agent 的同步与 SSE 路径都从这里取耗时 / 状态。
+- 全局开关：`AGENT_TOOL_TIMEOUT` / `AGENT_TOOL_RETRIES` / `AGENT_TOOL_PARALLEL`。
+  自定义工具不登记也会拿到默认策略；要单独收紧时构造
+  `ToolPolicies(default=..., overrides={"my_tool": ToolPolicy(timeout=5)})` 传给 `build_tool_node`。
+- 尚未做：MCP（`langchain-mcp-adapters`）让工具从「写死清单」变成可配置服务器（见评审 A-09）。
 
 ### 3. RAG 问答图（`graph/rag_chat.py` + `rag/milvus_search.py` + `rag/doc_names.py`）
 
@@ -1077,6 +1106,7 @@ uv run ai-agent-py db import-jobs             # 写入 tb_document_parse_job
 | 支持新文件类型（HTML、Excel…） | `rag/loaders.py::load_file` 加分支 |
 | 加召回后重排（rerank） | `rag/rerank.py`（已内置 `qwen3.7-text-rerank`），实现 `Reranker.rerank` 即可替换 |
 | 调 RAG 问答检索策略 | `rag/milvus_search.py`（两路候选数 `MILVUS_CANDIDATES`、`RRFRanker(MILVUS_RRF_K)`、精排候选 `RERANK_CANDIDATES`、缺 Key 退 BM25） |
+| 加工具 / 改工具策略 | 工具函数放 `tools/`，在 `tools/policy.py::ToolPolicies.from_settings` 登记 `ToolPolicy(timeout / retryable / concurrent / risk_level)`；执行逻辑只需改 `graph/nodes.py::build_tool_node` 一处 |
 | RAG 记录加筛选维度 | `rag/records.py::build_filter` + `rag/models.py::RagChunkListOut` + 前端筛选栏 |
 | 解析更多文件类型 | `mineru/service.py::ALLOWED_SUFFIXES` + `.env` 里的 `MINERU_MAX_FILE_MB` |
 | 换解析服务（Unstructured 等） | 实现与 `MineruClient` 相同的方法，替换 `DocumentService(client_factory=...)` |
@@ -1085,7 +1115,7 @@ uv run ai-agent-py db import-jobs             # 写入 tb_document_parse_job
 ## 开发
 
 ```powershell
-uv run pytest            # 404 个测试，全部离线（MinerU / 精排用 httpx.MockTransport，任务记录库用内存 JobStore，RAG 记录 / 问答用假 Milvus 客户端与脚本化模型；检索链路用 offline.OfflineChunkSearcher）
+uv run pytest            # 420 个测试，全部离线（MinerU / 精排用 httpx.MockTransport，任务记录库用内存 JobStore，RAG 记录 / 问答用假 Milvus 客户端与脚本化模型；检索链路用 offline.OfflineChunkSearcher）
 uv run ruff check .      # 静态检查
 uv run ruff format .     # 格式化
 uv run mypy              # 类型检查（src 目录）
@@ -1188,6 +1218,13 @@ MySQL：`tb_agent_chat_session`（会话）、`tb_agent_chat_message`（消息�
 `AGENT_TOOL_RESULT_MAX_CHARS` / `AGENT_TOOL_TURN_MAX_CHARS`（工具输出预算）。
 中文估算按 `AGENT_TOKEN_CHARS=2.0`；如果用的模型 tokenizer 更"费"，再调小。
 摘要失败时会自动降级为窗口截断，不影响对话。
+
+**工具调用了很久 / 报「工具执行超时」怎么办？**
+每次工具调用都有 `AGENT_TOOL_TIMEOUT` 秒的硬超时（默认 60）；`shell` 例外——它的截止时间由
+命令自己的 `timeout` 参数控制（默认 `AGENT_SHELL_TIMEOUT=120`，上限 3600）。超时只让这一次
+调用返回「工具执行超时」，图会继续，模型通常会缩小范围后重试。长构建 / 全量测试建议拆成多次
+命令，或让模型显式传更大的 `timeout`。知识库检索与联网工具遇到网络、429、5xx 会自动重试
+`AGENT_TOOL_RETRIES` 次（默认 1）；`AGENT_TOOL_PARALLEL=false` 可关闭同一轮的并行执行。
 
 **亮色 / 暗色主题怎么切换？**
 页面右上角的月亮 / 太阳按钮，选择保存在浏览器 `localStorage`，刷新或重启服务都保持；
