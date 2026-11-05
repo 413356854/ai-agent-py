@@ -236,12 +236,40 @@ export interface RagSource {
   snippet: string
 }
 
+/** 引用校验结论：ok=通过；weak=支持度弱但保留；invalid=编号越界；unsupported=数字冲突。 */
+export type RagCitationStatus = 'ok' | 'weak' | 'invalid' | 'unsupported'
+
+/** 答案里的一条引用及校验结果；被移除的条目 start/end 为 null。 */
+export interface RagCitation {
+  index: number
+  chunk_id: string
+  doc_id: string
+  quote: string
+  start: number | null
+  end: number | null
+  status: RagCitationStatus
+  reason: string
+  removed: boolean
+}
+
+/** 一次回答的引用统计；total = ok + weak + removed。 */
+export interface RagCitationStats {
+  total: number
+  ok: number
+  weak: number
+  removed: number
+  invalid: number
+  unsupported: number
+}
+
 /** `POST /api/rag/chat` 的响应。 */
 export interface RagChatResponse {
   answer: string
   thread_id: string
   query: string
   sources: RagSource[]
+  citations: RagCitation[]
+  citation_stats: RagCitationStats
 }
 
 /** SSE 事件回调（`POST /api/rag/chat/stream`）。 */
@@ -249,7 +277,13 @@ export interface RagChatStreamHandlers {
   onStage?: (stage: string, message: string) => void
   onSources?: (payload: { query: string; sources: RagSource[] }) => void
   onToken?: (text: string) => void
-  onDone?: (payload: { answer: string; query: string; sources: RagSource[] }) => void
+  onDone?: (payload: {
+    answer: string
+    query: string
+    sources: RagSource[]
+    citations: RagCitation[]
+    citation_stats: RagCitationStats | null
+  }) => void
   onError?: (message: string) => void
 }
 

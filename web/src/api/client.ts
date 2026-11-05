@@ -26,6 +26,8 @@ import type {
   RagChatStreamHandlers,
   RagChunkList,
   RagChunkParams,
+  RagCitation,
+  RagCitationStats,
   RagIngestParams,
   RagIngestResult,
   RagOverview,
@@ -153,21 +155,22 @@ export const api = {
     return request<RagChunkList>(`/api/rag/chunks${suffix}`)
   },
 
-  /** 非流式问答；聊天界面用 `ragChatStream` 逐 token 显示。 */
-  ragChat: (message: string, threadId: string) =>
+  /** 非流式问答；聊天界面用 `ragChatStream` 逐 token 显示。`docIds` 非空时只在这些文档内检索。 */
+  ragChat: (message: string, threadId: string, docIds: string[] = []) =>
     request<RagChatResponse>('/api/rag/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message, thread_id: threadId }),
+      body: JSON.stringify({ message, thread_id: threadId, doc_ids: docIds }),
     }),
 
   /** 流式问答：`stage` → `sources` → 若干 `token` → `done`（异常走 `error`）。 */
   ragChatStream: (
     message: string,
     threadId: string,
+    docIds: string[],
     handlers: RagChatStreamHandlers,
     signal?: AbortSignal,
-  ) => streamRagChat(message, threadId, handlers, signal),
+  ) => streamRagChat(message, threadId, docIds, handlers, signal),
 
   /* ---- Agent 应用（报销审核等）--------------------------------------- */
   agents: () => request<AgentSummary[]>('/api/agents'),
@@ -397,12 +400,13 @@ async function openEventStream(
 async function streamRagChat(
   message: string,
   threadId: string,
+  docIds: string[],
   handlers: RagChatStreamHandlers,
   signal?: AbortSignal,
 ): Promise<void> {
   const events = await openEventStream(
     '/api/rag/chat/stream',
-    { message, thread_id: threadId },
+    { message, thread_id: threadId, doc_ids: docIds },
     signal,
   )
 
@@ -414,6 +418,8 @@ async function streamRagChat(
       continue
     }
     const sources = (payload.sources as RagSource[] | undefined) ?? []
+    const citations = (payload.citations as RagCitation[] | undefined) ?? []
+    const citationStats = (payload.citation_stats as RagCitationStats | undefined) ?? null
     if (event === 'stage') {
       handlers.onStage?.(String(payload.stage ?? ''), String(payload.message ?? ''))
     } else if (event === 'sources') {
@@ -425,6 +431,8 @@ async function streamRagChat(
         answer: String(payload.answer ?? ''),
         query: String(payload.query ?? ''),
         sources,
+        citations,
+        citation_stats: citationStats,
       })
     } else if (event === 'error') {
       handlers.onError?.(String(payload.message ?? '问答失败'))

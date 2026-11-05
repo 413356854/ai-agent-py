@@ -16,6 +16,7 @@ from ai_agent_py.graph.rag_chat import (
     build_rag_chat_graph,
     rag_chat_config,
 )
+from ai_agent_py.rag.filters import SearchFilter
 from fakes import FakeDocumentNameResolver, ScriptedChatModel, StreamingScriptedChatModel
 
 _FILE_NAME = "中华人民共和国企业所得税法实施条例.docx"
@@ -24,10 +25,18 @@ _FILE_NAME = "中华人民共和国企业所得税法实施条例.docx"
 class FakeSearcher:
     def __init__(self, count: int = 2) -> None:
         self.queries: list[str] = []
+        self.filters: list[SearchFilter | None] = []
         self.count = count
 
-    def search(self, query: str, *, k: int | None = None) -> list[Document]:
+    def search(
+        self,
+        query: str,
+        *,
+        k: int | None = None,
+        filter: SearchFilter | None = None,
+    ) -> list[Document]:
         self.queries.append(query)
+        self.filters.append(filter)
         return [
             Document(
                 page_content=f"第 {index} 条资料：与「{query}」有关的内容",
@@ -64,6 +73,53 @@ def make_graph(
     return graph, searcher
 
 
+class LegalSearcher:
+    """固定正文的检索器：用来构造「引用被支持 / 不被支持」的答案。"""
+
+    def __init__(self, contents: list[str]) -> None:
+        self.contents = contents
+        self.queries: list[str] = []
+        self.filters: list[SearchFilter | None] = []
+
+    def search(
+        self,
+        query: str,
+        *,
+        k: int | None = None,
+        filter: SearchFilter | None = None,
+    ) -> list[Document]:
+        self.queries.append(query)
+        self.filters.append(filter)
+        return [
+            Document(
+                page_content=content,
+                metadata={
+                    "chunk_id": f"chunk-{index}",
+                    "doc_id": "doc-a",
+                    "chunk_index": index,
+                    "page": 1,
+                    "source": "doc-a",
+                },
+            )
+            for index, content in enumerate(self.contents)
+        ]
+
+
+def make_legal_graph(
+    model: Any,
+    searcher: LegalSearcher,
+    *,
+    checkpointer: Any = None,
+) -> Any:
+    return build_rag_chat_graph(
+        llm=model,
+        searcher=searcher,
+        resolver=FakeDocumentNameResolver({"doc-a": _FILE_NAME}),
+        settings=Settings(_env_file=None),
+        checkpointer=checkpointer,
+    )
+
+
 def test_first_turn_answers_without_rewriting() -> None:
     model = ScriptedChatModel(responses=[AIMessage(content="答案一")])
     graph, searcher = make_graph(model)
@@ -78,14 +134,17 @@ def test_first_turn_answers_without_rewriting() -> None:
     assert searcher.queries == ["企业所得税的扣除项目有哪些？"]
 
 
-def test_answer_normalizes_out_of_range_citation() -> None:
-    """模型把法条号写成 [43] 时，answer 节点会校正成汉字法条引用。"""
+def test_answer_removes_out_of_range_citation() -> None:
+    """模型把法条号写成 [43] 时，answer 节点删除编号，不再改写成汉字法条。"""
     model = ScriptedChatModel(responses=[AIMessage(content="扣除标准是 60%[43]。")])
     graph, _ = make_graph(model, count=2)
 
     turn = ask_rag_chat(graph, "业务招待费的扣除标准是什么？")
 
-    assert turn.answer == "扣除标准是 60%（第四十三条）。"
+    assert turn.answer == "扣除标准是 60%。"
+    assert turn.citation_stats.invalid == 1
+    assert turn.citation_stats.removed == 1
+    assert turn.citations[0].removed is True
 
 
 def test_prompt_bounds_citation_numbers_and_bans_article_numbers() -> None:
@@ -258,3 +317,87 @@ def test_stream_mode_emits_answer_tokens_only() -> None:
     assert any("retrieve" in update for update in updates)
     assert any("resolve" in update for update in updates)
     assert any("answer" in update for update in updates)
+
+
+# ---- 文档级过滤（R-01）----------------------------------------------------
+def test_doc_ids_are_forwarded_as_search_filter() -> None:
+    model = ScriptedChatModel(responses=[AIMessage(content="答案一")])
+    graph, searcher = make_graph(model)
+
+    ask_rag_chat(graph, "业务招待费的扣除标准是什么？", doc_ids=["doc-a", "doc-b"])
+
+    assert searcher.filters == [SearchFilter(doc_ids=("doc-a", "doc-b"))]
+
+
+def test_doc_ids_scope_is_reset_on_next_turn() -> None:
+    """上一轮选了文档，下一轮不传 doc_ids 时必须回到全库，不能沿用旧范围。"""
+    model = ScriptedChatModel(
+        responses=[
+            AIMessage(content="答案一"),
+            AIMessage(content="业务招待费的扣除标准是什么？"),
+            AIMessage(content="答案二"),
+        ]
+    )
+    graph, searcher = make_graph(model, checkpointer=InMemorySaver())
+
+    ask_rag_chat(graph, "企业所得税的扣除项目有哪些？", thread_id="t-filter", doc_ids=["doc-a"])
+    ask_rag_chat(graph, "那业务招待费呢？", thread_id="t-filter")
+
+    assert searcher.filters == [SearchFilter(doc_ids=("doc-a",)), None]
+
+
+# ---- 引用校验与历史隔离（R-03 / D-01）-------------------------------------
+def test_history_strips_previous_citation_numbers() -> None:
+    """上一轮答案里的 [n] 进下一轮 prompt 前必须剥掉，否则会和本轮编号冲突。"""
+    searcher = LegalSearcher(["业务招待费按发生额的60%扣除。"])
+    model = ScriptedChatModel(
+        responses=[
+            AIMessage(content="业务招待费按60%扣除[1]。"),
+            AIMessage(content="业务招待费的扣除标准是什么？"),
+            AIMessage(content="答案二"),
+        ]
+    )
+    graph = make_legal_graph(model, searcher, checkpointer=InMemorySaver())
+
+    first = ask_rag_chat(graph, "业务招待费怎么扣？", thread_id="t-history")
+    assert first.citation_stats.ok == 1
+
+    ask_rag_chat(graph, "那它的标准呢？", thread_id="t-history")
+
+    condense_prompt = model.received[1][-1].content
+    assert isinstance(condense_prompt, str)
+    assert "业务招待费按60%扣除" in condense_prompt
+    assert "[1]" not in condense_prompt
+
+    answer_messages = model.received[2]
+    history = [message_text(message) for message in answer_messages if message.type == "ai"]
+    assert history == ["业务招待费按60%扣除。"]
+
+
+def test_no_context_turn_clears_previous_citations() -> None:
+    """无召回时不能把上一轮 checkpointer 里的 citations 带出来。"""
+    model = ScriptedChatModel(responses=[AIMessage(content="答案[1]"), AIMessage(content="第二问")])
+    graph, searcher = make_graph(model, checkpointer=InMemorySaver())
+
+    first = ask_rag_chat(graph, "第一问", thread_id="t-clear")
+    assert first.citation_stats.total == 1
+
+    searcher.count = 0
+    second = ask_rag_chat(graph, "第二问", thread_id="t-clear")
+
+    assert second.answer == NO_CONTEXT_ANSWER
+    assert second.citations == []
+    assert second.citation_stats.total == 0
+
+
+def test_empty_documents_are_filtered_before_numbering() -> None:
+    """空片段被过滤后，答案里的 [1] 必须对应过滤后的第一条，而不是原始下标。"""
+    searcher = LegalSearcher(["", "业务招待费按60%扣除。"])
+    model = ScriptedChatModel(responses=[AIMessage(content="业务招待费按60%扣除[1]。")])
+    graph = make_legal_graph(model, searcher)
+
+    turn = ask_rag_chat(graph, "业务招待费怎么扣？")
+
+    assert [document.metadata["chunk_id"] for document in turn.documents] == ["chunk-1"]
+    assert turn.citations[0].chunk_id == "chunk-1"
+    assert turn.citation_stats.ok == 1

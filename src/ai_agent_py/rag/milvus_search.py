@@ -11,6 +11,13 @@
 候选，交给 `rag.rerank.DashScopeReranker`（qwen3.7-text-rerank）重新打分后再截到
 ``k`` 条；精排失败只记 warning，退回 RRF 顺序，不影响问答可用性。
 
+``search(..., filter=SearchFilter(doc_ids=...))`` 把检索限定在指定文档内：
+表达式由 `rag.filters.build_filter_expr` 统一生成。稠密 / BM25 单路检索把它传给
+Milvus ``search`` 的 ``filter`` 参数；混合检索则要挂在**每个** ``AnnSearchRequest``
+的 ``expr`` 上——pymilvus 的 ``hybrid_search`` 没有顶层 ``filter`` 参数，只挂在
+其中一个子请求上会让另一路把范围外的块带回来。``doc_id`` 上已有 INVERTED 索引，
+过滤不会退化成全量扫描。
+
 降级策略（本地没配 embedding Key 时也能用）：
 
 * 有 Embedding Key：稠密 + BM25 混合检索；
@@ -32,6 +39,7 @@ from langchain_core.embeddings import Embeddings
 from ai_agent_py.config import Settings, get_settings
 from ai_agent_py.errors import ConfigurationError, MilvusError, MilvusSchemaError
 from ai_agent_py.llm import get_embeddings
+from ai_agent_py.rag.filters import SearchFilter, build_filter_expr
 from ai_agent_py.rag.milvus import create_milvus_client
 from ai_agent_py.rag.rerank import Reranker, get_reranker
 
@@ -48,8 +56,17 @@ PREPARE_TTL_SECONDS = 30.0
 class DocumentSearcher(Protocol):
     """检索接口：`graph.rag_chat` 只依赖这个方法，测试可以注入假实现。"""
 
-    def search(self, query: str, *, k: int | None = None) -> list[Document]:
-        """返回与 ``query`` 最相关的片段（``metadata`` 里带 chunk_id / doc_id / page）。"""
+    def search(
+        self,
+        query: str,
+        *,
+        k: int | None = None,
+        filter: SearchFilter | None = None,
+    ) -> list[Document]:
+        """返回与 ``query`` 最相关的片段（``metadata`` 里带 chunk_id / doc_id / page）。
+
+        ``filter`` 限定检索范围（目前只有文档级）；``None`` 表示全库。
+        """
         ...
 
 
@@ -69,6 +86,7 @@ class MilvusChunkSearcher:
         self._embeddings = embeddings
         self._prepared_at = 0.0
         self._has_sparse = False
+        self._fields: frozenset[str] = frozenset()
         self._embedding_error: str | None = None
         # 构造时解析一次：没配 Key / 显式关闭时是 None，检索路径就完全不用判空。
         self.reranker: Reranker | None = (
@@ -110,6 +128,7 @@ class MilvusChunkSearcher:
         except Exception as exc:
             raise MilvusError(f"读取 Milvus 集合结构失败：{exc}") from exc
         fields = {str(field.get("name")): field for field in description.get("fields", []) if field}
+        self._fields = frozenset(fields)
         self._has_sparse = "sparse" in fields
         if "embedding" not in fields:
             raise MilvusSchemaError(f"Milvus 集合 {self.collection} 缺少 embedding 字段")
@@ -120,12 +139,28 @@ class MilvusChunkSearcher:
         self._prepared_at = now
 
     # ---- 对外接口 -------------------------------------------------------
-    def search(self, query: str, *, k: int | None = None) -> list[Document]:
-        """混合检索（+ 可选精排）；返回的 ``Document.metadata`` 带 ``chunk_id`` 等字段。"""
+    def search(
+        self,
+        query: str,
+        *,
+        k: int | None = None,
+        filter: SearchFilter | None = None,
+    ) -> list[Document]:
+        """混合检索（+ 可选精排）；返回的 ``Document.metadata`` 带 ``chunk_id`` 等字段。
+
+        ``filter`` 只限定文档范围（``doc_ids``）：表达式由 `rag.filters` 生成，
+        转义后原样下传给 Milvus 的三路检索；``None`` / 空 ``doc_ids`` 表示全库。
+        """
         text = (query or "").strip()
         if not text:
             return []
         self._prepare()
+        expr = build_filter_expr(filter)
+        if expr and "doc_id" not in self._fields:
+            raise MilvusSchemaError(
+                f"Milvus 集合 {self.collection} 缺少 doc_id 字段，无法按文档过滤；"
+                "请按 docs/milvus/create_rag_chunk.py 重建集合并重新入库"
+            )
         limit = max(1, k or self.settings.retriever_k)
         # 精排需要比最终 k 更多的候选：只把 RRF 的前 k 条交给交叉编码器，
         # 等于在最坏情况下也只能「在已经选错的 4 条里换顺序」。
@@ -142,13 +177,13 @@ class MilvusChunkSearcher:
             )
 
         if vector is not None and self._has_sparse:
-            hits = self._hybrid(text, vector, fetch, candidates)
+            hits = self._hybrid(text, vector, fetch, candidates, expr)
             mode = "hybrid"
         elif vector is not None:
-            hits = self._dense(vector, fetch)
+            hits = self._dense(vector, fetch, expr)
             mode = "dense"
         else:
-            hits = self._bm25(text, fetch, candidates)
+            hits = self._bm25(text, fetch, candidates, expr)
             mode = "bm25"
 
         documents = [self._document(hit, mode) for hit in hits]
@@ -181,6 +216,7 @@ class MilvusChunkSearcher:
         vector: Sequence[float],
         limit: int,
         candidates: int,
+        expr: str = "",
     ) -> list[Any]:
         from pymilvus import AnnSearchRequest, RRFRanker
 
@@ -193,12 +229,14 @@ class MilvusChunkSearcher:
                     "params": {"ef": self.settings.milvus_ef},
                 },
                 limit=candidates,
+                expr=expr or None,
             ),
             AnnSearchRequest(
                 data=[text],
                 anns_field="sparse",
                 param={"metric_type": "BM25", "params": {}},
                 limit=candidates,
+                expr=expr or None,
             ),
         ]
         try:
@@ -213,7 +251,7 @@ class MilvusChunkSearcher:
             raise MilvusError(f"Milvus 混合检索失败：{exc}") from exc
         return list(result[0]) if result else []
 
-    def _dense(self, vector: Sequence[float], limit: int) -> list[Any]:
+    def _dense(self, vector: Sequence[float], limit: int, expr: str = "") -> list[Any]:
         try:
             result = self.client.search(
                 self.collection,
@@ -225,12 +263,13 @@ class MilvusChunkSearcher:
                 },
                 limit=limit,
                 output_fields=list(SEARCH_FIELDS),
+                **_filter_kwargs(expr),
             )
         except Exception as exc:
             raise MilvusError(f"Milvus 向量检索失败：{exc}") from exc
         return list(result[0]) if result else []
 
-    def _bm25(self, text: str, limit: int, candidates: int) -> list[Any]:
+    def _bm25(self, text: str, limit: int, candidates: int, expr: str = "") -> list[Any]:
         try:
             result = self.client.search(
                 self.collection,
@@ -239,6 +278,7 @@ class MilvusChunkSearcher:
                 search_params={"metric_type": "BM25", "params": {}},
                 limit=min(limit, candidates),
                 output_fields=list(SEARCH_FIELDS),
+                **_filter_kwargs(expr),
             )
         except Exception as exc:
             raise MilvusError(f"Milvus 关键词检索失败：{exc}") from exc
@@ -309,6 +349,11 @@ def get_milvus_searcher(
         embeddings=embeddings,
         reranker=reranker,
     )
+
+
+def _filter_kwargs(expr: str) -> dict[str, Any]:
+    """有过滤条件时才把 ``filter`` 传给 Milvus：无过滤的检索请求保持原样。"""
+    return {"filter": expr} if expr else {}
 
 
 def _hit_id(hit: Any) -> str:

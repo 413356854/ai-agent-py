@@ -28,6 +28,7 @@ from langchain_core.embeddings import Embeddings
 from ai_agent_py.config import Settings, get_settings
 from ai_agent_py.errors import ConfigurationError, MilvusError, MilvusSchemaError
 from ai_agent_py.llm import get_embeddings
+from ai_agent_py.rag.filters import escape_literal
 
 logger = logging.getLogger(__name__)
 
@@ -235,7 +236,7 @@ class MilvusRagWriter:
     def _delete_document(self, doc_id: str) -> None:
         """删除该文档在集合里的全部切片（重复入库前先清空旧版本）。"""
         try:
-            self.client.delete(self.collection, filter=f'doc_id == "{_quote(doc_id)}"')
+            self.client.delete(self.collection, filter=f'doc_id == "{escape_literal(doc_id)}"')
         except Exception as exc:
             raise MilvusError(f"删除旧切片失败（doc_id={doc_id}）：{exc}") from exc
 
@@ -279,11 +280,6 @@ class MilvusRagWriter:
             "content": content,
             "embedding": list(vector),
         }
-
-
-def _quote(value: str) -> str:
-    """转义 Milvus 过滤表达式里的字符串字面量。"""
-    return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def _page_of(chunk: Document) -> int | None:

@@ -17,7 +17,7 @@
      ├─ 智能体（LangGraph）： agent ⇄ tools(search_knowledge_base) → 答案
      ├─ RAG 问答（LangGraph）： condense → retrieve(Milvus rag_chunk)
      │                          → resolve(MySQL 文件名) → answer
-     │                          → SSE 流式答案 + 引用片段
+     │                          → SSE 流式答案 + 引用校验 + 引用片段
      └─ 通用 Agent（LangGraph）： agent ⇄ 全部工具（文件 / 命令 / 知识库 / 联网）
                                 → MySQL 会话记忆 + SSE 实时工具调用
 ```
@@ -62,8 +62,11 @@
 - **RAG 问答**：聊天式问答页 + **LangGraph** 编排的 `condense → retrieve → resolve → answer` 图：
   多轮追问先改写成独立问题，再在 `rag_chunk` 上做稠密 + BM25 + RRF 混合检索，RRF 后再用
   `qwen3.7-text-rerank` 精排；检索后按 `doc_id` 回查 MySQL 文件名，让模型在提示词里看到
-  「来源：xxx.docx」而不是 `doc-1a2b…`，最后带 `[1] [2]` 引用作答。答案通过 **SSE 逐 token 推送**，
+  「来源：xxx.docx」而不是 `doc-1a2b…`，最后带 `[1] [2]` 引用作答。答案引用会做**存在性、
+  数字归一化与支持度校验**：越界编号和与资料数字冲突的引用会被移除并提示，术语重合度低
+  只标黄保留；正文 `[n]` 可点击定位到下方来源片段。答案通过 **SSE 逐 token 推送**，
   引用片段可点开查看原文与相关度；页头标签实时显示 LLM 模型、检索方式与精排是否启用。
+  页面底部可**按文档限定检索范围**（请求体 `doc_ids`），不选则检索全部已入库文档。
   （没有 Embedding Key 时自动退化为 BM25 关键词检索；没有精排 Key 时跳过精排；没有 LLM Key
   时页面给出明确提示。）
 - **Agent 应用（报销审核）**：`reimburse` 是一张 9 节点的 LangGraph 工序图（G1 接入 → G2 抽取 →
@@ -119,6 +122,8 @@ ai-agent-py/
 │   │   ├── loaders.py        # txt/md/pdf/docx → Document（含编码回退、页码）
 │   │   ├── splitter.py       # 按后缀：Markdown / HTML / JSON / 递归切分
 │   │   ├── chunk_cache.py    # 切分结果缓存：split_id → 完整切片（TTL + LRU）
+│   │   ├── filters.py        # 检索过滤条件：类型化 SearchFilter + Milvus 表达式转义
+│   │   ├── citations.py      # 答案引用校验：存在性 / 数字归一化 / 支持度 / citation span
 │   │   ├── milvus.py         # 切分块写入 Milvus rag_chunk（稠密 + BM25，覆盖写）
 │   │   ├── milvus_search.py  # rag_chunk 混合检索（稠密 + BM25 + RRF + 精排，缺 Key 退 BM25）
 │   │   ├── doc_names.py      # 检索后按 doc_id 回查 MySQL 文件名（批量 + 缓存 + 降级）
@@ -226,7 +231,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:8000/query -Method Post `
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/query` | RAG 链问答，返回 `answer` + `sources`（来源、页码、片段） |
+| POST | `/query` | RAG 链问答，返回 `answer` + `sources` + `citations` + `citation_stats`（引用已做存在性/数字校验） |
 | POST | `/chat` | 智能体对话，`thread_id` 相同则保留上下文 |
 | GET | `/api/agents` | Agent 应用列表（节点数 / 规则数） |
 | GET | `/api/agents/{id}/graph` | LangGraph 图导出：`mermaid` 源码 + 节点 / 边 |
@@ -264,8 +269,8 @@ Invoke-RestMethod -Uri http://127.0.0.1:8000/query -Method Post `
 | DELETE | `/api/oss/images/{key}` | 删除图片（会话或 `X-OSS-Access`） |
 | GET | `/api/rag/overview` | **RAG 记录 / 问答**概览：Milvus 连接、总块数、文档分布、模型配置状态（含精排 `rerank_model` / `rerank_configured`） |
 | GET | `/api/rag/chunks` | **`rag_chunk` 记录列表**：`doc_id` / `keyword` / `page` / `page_size` |
-| POST | `/api/rag/chat` | **RAG 问答**（LangGraph，`thread_id` 保留多轮上下文）→ `answer` + `sources` |
-| POST | `/api/rag/chat/stream` | 同上，SSE 流式：`stage` → `sources` → `token`… → `done` |
+| POST | `/api/rag/chat` | **RAG 问答**（LangGraph，`thread_id` 保留多轮上下文，`doc_ids` 限定检索文档）→ `answer` + `sources` + `citations` + `citation_stats` |
+| POST | `/api/rag/chat/stream` | 同上，SSE 流式：`stage` → `sources` → `token`… → `done`（`done` 带 `citations` / `citation_stats`） |
 
 ## 切分与入库 RAG（百炼 text-embedding-v4 + Milvus）
 
@@ -367,16 +372,30 @@ START ──▶ condense ──▶ retrieve ──▶ resolve ──▶ answer �
   `RERANK_CANDIDATES` 条候选交给 `qwen3.7-text-rerank` 重新打分，最后取 `RETRIEVER_K` 条。
   精排失败（超时 / 401 / 配额）只记 warning 并退回 RRF 顺序，不影响问答可用性；没配精排 Key
   时这一步直接跳过（等价于只用 RRF）；
+- **文档级过滤**：请求体带 `doc_ids`（最多 50 篇，单个 id ≤ 64 字符）时，只在这些文档的切片里
+  检索；不传 / 传空数组表示全库。过滤条件走 `rag/filters.py` 的 `SearchFilter`——只接受类型化
+  字段，表达式由 `build_filter_expr()` 生成并转义引号，不会把用户输入当表达式执行；`doc_id`
+  上的 INVERTED 索引现成，三路检索（hybrid / dense / BM25）都会带上同一个过滤表达式
+  （混合检索挂在每个 `AnnSearchRequest` 的 `expr` 上，单路检索用原生 `filter=`）。
+  **多轮对话每轮都要带**：未带 `doc_ids` 的请求按「全库」处理，不会沿用上一轮的范围
+  （前端「检索范围」选择框在每次发送时都会带上当前选择）；
 - **resolve**：`rag_chunk` 只有 `doc_id`，文件名在 MySQL `tb_document_parse_job`。这里按本次
   召回的 id 批量回查文件名（`WHERE id IN (...)`，同一篇文档的多个片段只查一次，结果进程内
   缓存），写回片段 `metadata["source"]`，所以模型看到的来源是「xxx.docx」而不是
   「doc-1a2b…」。MySQL 未配置 / 宕机 / 表不存在时只记 warning，来源退回 `doc_id`，问答照常；
 - **answer**：把片段按 `[1] [2]` 编号拼进提示词，并声明「共 N 条，编号 1~N」；**没有召回时
   不调用 LLM**，直接返回兜底文案（省钱、避免幻觉）；
-- **引用校正**：模型偶尔把法条序号当来源编号（「第四十三条」写成 `[43]`）。提示词里明确禁止并
-  给了反例，`rag/chain.py::normalize_citations` 再做一层确定性兜底：若恰好一条片段正文包含
-  「第 N 条」就改写成该片段的编号（`[43]` → `[2]`），无法唯一定位则写成「（第四十三条）」；
-  越界数字会打 warning 日志，不影响有效编号；
+- **引用校验**：`answer` 节点的回答会经过 `rag/citations.py::verify_citations` 后处理——解析
+  `[n]` → 存在性校验（`1..N`）→ 句级归因（每条引用只对它前面、上一条引用之后的那段话负责）
+  → 数字归一化（`60%` / `百分之六十` / `0.6` 视为同一值，`5‰` / `千分之五` / `0.5%` 同理）
+  → 支持度判定。**编号越界、引用片段为空、数字与片段冲突**的引用会从答案里删除并计入
+  `citation_stats`；术语重合度低或法条号对不上只标记 `weak`（保留引用、来源 chip 标黄），
+  因为概括性正确引用的字符重合度可能很低（实测 0.07），硬删会误伤。旧实现把越界编号改写成
+  「（第 N 条）」的逻辑已移除，避免把幻觉引用洗成合法引用（D-18）；
+- **历史引用隔离**：上一轮答案里的 `[n]` 属于上一轮编号，`condense` / `answer` 的提示词在
+  渲染历史时会先剥掉（`strip_citations`），不会和本轮重新从 1 开始的编号冲突（D-01）；
+- **前端引用定位**：`citations` 带答案内 `start/end`，正文里的 `[n]` 渲染成可点击的 `<sup>`，
+  点击滚动并高亮对应的来源卡片；被移除的引用在回答下方给出提示，弱支持 chip 为橙色；
 - 多轮上下文由 LangGraph `InMemorySaver` 按 `thread_id` 保存在**服务端进程内**：刷新页面后
   点「新会话」换一个 `thread_id` 即可重新开始；服务重启后旧会话失效；
 - 前端用 `POST /api/rag/chat/stream`（SSE）逐 token 渲染，事件顺序为
@@ -394,6 +413,11 @@ START ──▶ condense ──▶ retrieve ──▶ resolve ──▶ answer �
 Invoke-RestMethod -Uri http://127.0.0.1:8000/api/rag/chat -Method Post `
   -ContentType 'application/json' `
   -Body '{"message":"企业所得税的扣除项目有哪些？","thread_id":"demo-1"}'
+
+# 只在一篇文档内检索：doc_ids 取自 /api/rag/overview 的 docs[].doc_id（每轮都要带）
+Invoke-RestMethod -Uri http://127.0.0.1:8000/api/rag/chat -Method Post `
+  -ContentType 'application/json' `
+  -Body '{"message":"住宿费标准是多少？","thread_id":"demo-2","doc_ids":["doc-1a2b3c4d"]}'
 
 # 流式（SSE）：浏览器里由前端 fetch 读取，命令行可用 curl -N
 curl.exe -N -X POST http://127.0.0.1:8000/api/rag/chat/stream `
@@ -891,8 +915,9 @@ START ──▶ condense ──▶ retrieve ──▶ resolve ──▶ answer �
         （首轮跳过）   RRF + 精排                 无召回不调 LLM
 ```
 
-- `RagChatState`：`messages`（`add_messages` 追加）+ `query` / `documents` / `answer`
-  （每轮覆盖）；`condense` / `retrieve` / `resolve` / `answer` 四个节点都是普通函数，可单独测试。
+- `RagChatState`：`messages`（`add_messages` 追加）+ `query` / `documents` / `answer` /
+  `citations` / `citation_stats`（每轮覆盖）；`condense` / `retrieve` / `resolve` / `answer`
+  四个节点都是普通函数，可单独测试。
 - 检索分两段：`MilvusChunkSearcher` 先做稠密 + BM25 + RRF 融合，配了 Key 时再把
   `RERANK_CANDIDATES` 条候选交给 `rag/rerank.py`（`qwen3.7-text-rerank`）精排后取
   `RETRIEVER_K` 条；精排异常被吞掉并退回 RRF 顺序，不影响问答可用性。
@@ -1042,7 +1067,7 @@ uv run ai-agent-py db import-jobs             # 写入 tb_document_parse_job
 ## 开发
 
 ```powershell
-uv run pytest            # 318 个测试，全部离线（MinerU / 精排用 httpx.MockTransport，任务记录库用内存 JobStore，RAG 记录 / 问答用假 Milvus 客户端与脚本化模型；检索链路用 offline.OfflineChunkSearcher）
+uv run pytest            # 384 个测试，全部离线（MinerU / 精排用 httpx.MockTransport，任务记录库用内存 JobStore，RAG 记录 / 问答用假 Milvus 客户端与脚本化模型；检索链路用 offline.OfflineChunkSearcher）
 uv run ruff check .      # 静态检查
 uv run ruff format .     # 格式化
 uv run mypy              # 类型检查（src 目录）

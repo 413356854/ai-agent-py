@@ -28,6 +28,7 @@ from ai_agent_py.graph.agent import ask_agent, build_agent_graph
 from ai_agent_py.llm import get_chat_model
 from ai_agent_py.rag.chain import answer_question
 from ai_agent_py.rag.milvus_search import get_milvus_searcher
+from ai_agent_py.rag.models import RagCitationOut, RagCitationStatsOut
 from ai_agent_py.rag.records import MilvusRagReader
 
 logger = logging.getLogger(__name__)
@@ -68,6 +69,8 @@ class SourceOut(BaseModel):
 class QueryResponse(BaseModel):
     answer: str
     sources: list[SourceOut]
+    citations: list[RagCitationOut] = Field(default_factory=list)
+    citation_stats: RagCitationStatsOut = Field(default_factory=RagCitationStatsOut)
 
 
 class ChatRequest(BaseModel):
@@ -159,6 +162,8 @@ def create_app() -> FastAPI:
         return QueryResponse(
             answer=result.answer,
             sources=[SourceOut(**source.as_dict()) for source in result.sources],
+            citations=[RagCitationOut(**citation.as_dict()) for citation in result.citations],
+            citation_stats=RagCitationStatsOut(**result.citation_stats.as_dict()),
         )
 
     @app.post("/chat", response_model=ChatResponse, tags=["agent"])

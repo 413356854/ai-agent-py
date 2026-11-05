@@ -29,6 +29,7 @@ from typing import Any
 
 from ai_agent_py.config import Settings, get_settings
 from ai_agent_py.errors import MilvusError, MilvusSchemaError
+from ai_agent_py.rag.filters import escape_literal
 from ai_agent_py.rag.milvus import create_milvus_client
 
 #: 列表接口返回的字段（不含两个向量字段）。
@@ -260,17 +261,12 @@ def build_filter(*, doc_id: str | None = None, keyword: str | None = None) -> st
     clauses: list[str] = []
     clean_doc = (doc_id or "").strip()
     if clean_doc:
-        clauses.append(f'doc_id == "{_escape_literal(clean_doc)}"')
+        clauses.append(f'doc_id == "{escape_literal(clean_doc)}"')
     clean_keyword = (keyword or "").strip()
     if clean_keyword:
         # like 的 % 是通配符：只转义会破坏字符串字面量的反斜杠与引号。
-        clauses.append(f'content like "%{_escape_literal(clean_keyword)}%"')
+        clauses.append(f'content like "%{escape_literal(clean_keyword)}%"')
     return " and ".join(clauses)
-
-
-def _escape_literal(value: str) -> str:
-    """转义 Milvus 过滤表达式里的字符串字面量。"""
-    return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def _as_int(value: Any, default: int = 0) -> int:

@@ -11,6 +11,7 @@ import ai_agent_py.rag.milvus_search as milvus_search
 from ai_agent_py.config import Settings
 from ai_agent_py.errors import ConfigurationError, MilvusSchemaError, RerankError
 from ai_agent_py.offline import LexicalHashEmbeddings
+from ai_agent_py.rag.filters import SearchFilter
 from ai_agent_py.rag.milvus_search import MilvusChunkSearcher
 
 HITS: list[dict[str, Any]] = [
@@ -40,9 +41,16 @@ HITS: list[dict[str, Any]] = [
 
 
 class FakeSearchClient:
-    def __init__(self, *, exists: bool = True, has_sparse: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        exists: bool = True,
+        has_sparse: bool = True,
+        doc_id_field: bool = True,
+    ) -> None:
         self.exists = exists
         self.has_sparse = has_sparse
+        self.doc_id_field = doc_id_field
         self.loaded = False
         self.hybrid_calls: list[dict[str, Any]] = []
         self.search_calls: list[dict[str, Any]] = []
@@ -53,12 +61,13 @@ class FakeSearchClient:
     def describe_collection(self, name: str) -> dict[str, Any]:
         fields: list[dict[str, Any]] = [
             {"name": "chunk_id"},
-            {"name": "doc_id"},
             {"name": "chunk_index"},
             {"name": "page"},
             {"name": "content"},
             {"name": "embedding"},
         ]
+        if self.doc_id_field:
+            fields.append({"name": "doc_id"})
         if self.has_sparse:
             fields.append({"name": "sparse"})
         return {"fields": fields}
@@ -75,7 +84,14 @@ class FakeSearchClient:
         output_fields: list[str] | None = None,
     ) -> list[list[dict[str, Any]]]:
         self.hybrid_calls.append(
-            {"requests": reqs, "ranker": ranker, "limit": limit, "output_fields": output_fields}
+            {
+                "requests": reqs,
+                "ranker": ranker,
+                "limit": limit,
+                "output_fields": output_fields,
+                # hybrid_search 没有顶层 filter：过滤条件挂在每个子请求的 expr 上。
+                "filters": [getattr(request, "expr", None) for request in reqs],
+            }
         )
         return [HITS[:limit]]
 
@@ -95,6 +111,7 @@ class FakeSearchClient:
                 "anns_field": anns_field,
                 "params": search_params,
                 "limit": limit,
+                "filter": kwargs.get("filter"),
             }
         )
         return [HITS[:limit]]
@@ -141,6 +158,7 @@ def make_searcher(
     dim: int = 8,
     exists: bool = True,
     has_sparse: bool = True,
+    doc_id_field: bool = True,
     embeddings: Embeddings | object | None = "auto",
     reranker: FakeReranker | None = None,
 ) -> tuple[MilvusChunkSearcher, FakeSearchClient]:
@@ -154,7 +172,7 @@ def make_searcher(
         retriever_k=2,
         rerank_candidates=30,
     )
-    client = FakeSearchClient(exists=exists, has_sparse=has_sparse)
+    client = FakeSearchClient(exists=exists, has_sparse=has_sparse, doc_id_field=doc_id_field)
     if embeddings == "auto":
         embeddings = LexicalHashEmbeddings(dimensions=dim)
     searcher = MilvusChunkSearcher(
@@ -271,3 +289,67 @@ def test_rerank_failure_falls_back_to_rrf_order() -> None:
     documents = searcher.search("业务招待费", k=2)
 
     assert [document.metadata["chunk_id"] for document in documents] == ["chunk-1", "chunk-2"]
+
+
+# ---- 文档级过滤（R-01）----------------------------------------------------
+def test_doc_ids_filter_is_passed_to_hybrid_search() -> None:
+    searcher, client = make_searcher()
+
+    searcher.search("业务招待费", k=2, filter=SearchFilter(doc_ids=("doc-a", "doc-b")))
+
+    expr = 'doc_id in ["doc-a", "doc-b"]'
+    # 稠密与 BM25 两路都要带过滤条件，否则没过滤的那一路会把范围外的块带回来。
+    assert client.hybrid_calls[0]["filters"] == [expr, expr]
+
+
+def test_filter_is_passed_to_bm25_fallback() -> None:
+    searcher, client = make_searcher(embeddings=BrokenEmbeddings())
+
+    searcher.search("业务招待费", k=2, filter=SearchFilter(doc_ids=("doc-a",)))
+
+    # 退化为 BM25 时过滤条件不能丢
+    assert [call["anns_field"] for call in client.search_calls] == ["sparse"]
+    assert client.search_calls[0]["filter"] == 'doc_id in ["doc-a"]'
+
+
+def test_filter_is_passed_to_dense_search() -> None:
+    searcher, client = make_searcher(has_sparse=False)
+
+    searcher.search("业务招待费", k=2, filter=SearchFilter(doc_ids=("doc-a",)))
+
+    assert client.hybrid_calls == []
+    assert [call["anns_field"] for call in client.search_calls] == ["embedding"]
+    assert client.search_calls[0]["filter"] == 'doc_id in ["doc-a"]'
+
+
+def test_no_filter_keeps_search_request_unchanged() -> None:
+    searcher, client = make_searcher()
+
+    searcher.search("业务招待费", k=2)
+    searcher.search("业务招待费", k=2, filter=SearchFilter())
+    searcher.search("业务招待费", k=2, filter=SearchFilter(doc_ids=("  ",)))
+
+    # 空 doc_ids 等价于不过滤：子请求不带 expr，检索行为与改造前一致。
+    assert [call["filters"] for call in client.hybrid_calls] == [
+        [None, None],
+        [None, None],
+        [None, None],
+    ]
+
+
+def test_filter_literal_is_escaped_before_reaching_milvus() -> None:
+    searcher, client = make_searcher()
+
+    searcher.search("业务招待费", filter=SearchFilter(doc_ids=('x" or doc_id != ""',)))
+
+    expr = 'doc_id in ["x\\" or doc_id != \\"\\""]'
+    assert client.hybrid_calls[0]["filters"] == [expr, expr]
+
+
+def test_filter_without_doc_id_field_gives_actionable_error() -> None:
+    searcher, client = make_searcher(doc_id_field=False)
+
+    with pytest.raises(MilvusSchemaError, match="doc_id"):
+        searcher.search("业务招待费", filter=SearchFilter(doc_ids=("doc-a",)))
+
+    assert client.hybrid_calls == []

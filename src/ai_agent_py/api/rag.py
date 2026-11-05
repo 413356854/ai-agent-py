@@ -5,7 +5,7 @@
 * ``GET /overview``：Milvus 连接参数、模型配置、总块数与文档分布；
 * ``GET /chunks``：分页查询 ``rag_chunk``（按文档 / 正文关键词过滤）；
 * ``POST /chat``：LangGraph 多轮问答（同步返回答案 + 引用；来源已按 ``doc_id``
-  回查 MySQL 文件名）；
+  回查 MySQL 文件名），请求里的 ``doc_ids`` 可把检索限定在指定文档内；
 * ``POST /chat/stream``：同上，用 SSE 逐 token 推送，供聊天界面使用。
 
 Milvus / 模型不可用时返回 502/503 与中文原因，前端直接展示，不用猜。
@@ -31,6 +31,7 @@ from ai_agent_py.graph.agent import message_text
 from ai_agent_py.graph.rag_chat import ask_rag_chat, build_rag_chat_graph, rag_chat_config
 from ai_agent_py.llm import get_chat_model
 from ai_agent_py.mineru.models import ParseJob
+from ai_agent_py.rag.citations import Citation
 from ai_agent_py.rag.doc_names import DOC_NAME_KEY, SOURCE_KEY
 from ai_agent_py.rag.milvus_search import MilvusChunkSearcher
 from ai_agent_py.rag.models import (
@@ -38,6 +39,8 @@ from ai_agent_py.rag.models import (
     RagChatResponse,
     RagChunkListOut,
     RagChunkOut,
+    RagCitationOut,
+    RagCitationStatsOut,
     RagDocOut,
     RagOverviewOut,
     RagSourceOut,
@@ -189,7 +192,12 @@ def list_chunks(
 def chat(payload: RagChatRequest) -> RagChatResponse:
     graph = _graph_or_503()
     try:
-        turn = ask_rag_chat(graph, payload.message, thread_id=payload.thread_id)
+        turn = ask_rag_chat(
+            graph,
+            payload.message,
+            thread_id=payload.thread_id,
+            doc_ids=payload.doc_ids,
+        )
     except AiAgentError as exc:
         raise _rag_error(exc) from exc
     except Exception as exc:  # 上游模型错误
@@ -200,6 +208,8 @@ def chat(payload: RagChatRequest) -> RagChatResponse:
         thread_id=payload.thread_id,
         query=turn.query,
         sources=_sources(turn.documents),
+        citations=_citations(turn.citations),
+        citation_stats=RagCitationStatsOut(**turn.citation_stats.as_dict()),
     )
 
 
@@ -233,6 +243,8 @@ def _stream_events(
     query = ""
     answer = ""
     documents: list[Document] = []
+    citations: list[dict[str, Any]] = []
+    citation_stats: dict[str, Any] = {}
     yield _sse("stage", {"stage": "retrieve", "message": "正在检索知识库…"})
 
     try:
@@ -241,7 +253,11 @@ def _stream_events(
         stream = cast(
             "Iterator[tuple[str, Any]]",
             graph.stream(
-                {"messages": [HumanMessage(content=payload.message)]},
+                {
+                    "messages": [HumanMessage(content=payload.message)],
+                    # 每轮写回过滤范围：空列表 = 全库，避免沿用上一轮的 doc_ids。
+                    "doc_ids": list(payload.doc_ids),
+                },
                 config,
                 stream_mode=["messages", "updates"],
             ),
@@ -280,6 +296,14 @@ def _stream_events(
                         )
                     elif node == "answer":
                         answer = str(update.get("answer") or answer)
+                        # answer 节点会写回过滤后的 documents，和 citations 的编号对齐；
+                        # 早期 sources 事件可能带着空片段，done 里用这份覆盖。
+                        if isinstance(update.get("documents"), list):
+                            documents = list(update["documents"])
+                        if isinstance(update.get("citations"), list):
+                            citations = list(update["citations"])
+                        if isinstance(update.get("citation_stats"), dict):
+                            citation_stats = dict(update["citation_stats"])
     except GeneratorExit:  # 客户端断开：让 LangGraph 正常收尾
         raise
     except Exception as exc:
@@ -293,6 +317,8 @@ def _stream_events(
             "answer": answer,
             "query": query,
             "sources": [source.model_dump() for source in _sources(documents)],
+            "citations": [RagCitationOut(**item).model_dump() for item in citations],
+            "citation_stats": RagCitationStatsOut(**citation_stats).model_dump(),
         },
     )
 
@@ -363,6 +389,11 @@ def _sources(documents: Sequence[Document]) -> list[RagSourceOut]:
             )
         )
     return sources
+
+
+def _citations(citations: Sequence[Citation]) -> list[RagCitationOut]:
+    """把 `rag.citations.Citation` 转成接口模型（含已移除的条目）。"""
+    return [RagCitationOut(**citation.as_dict()) for citation in citations]
 
 
 def _snippet(text: str, limit: int = SNIPPET_CHARACTERS) -> str:

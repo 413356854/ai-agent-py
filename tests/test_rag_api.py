@@ -22,6 +22,7 @@ from ai_agent_py.mineru.models import (
     ParseOptions,
     RagIngestInfo,
 )
+from ai_agent_py.rag.filters import MAX_FILTER_DOC_IDS, SearchFilter
 from ai_agent_py.rag.records import (
     RagChunkPage,
     RagChunkRecord,
@@ -78,8 +79,16 @@ class BrokenReader:
 class FakeSearcher:
     def __init__(self, *, reranked: bool = False) -> None:
         self.reranked = reranked
+        self.filters: list[SearchFilter | None] = []
 
-    def search(self, query: str, *, k: int | None = None) -> list[Document]:
+    def search(
+        self,
+        query: str,
+        *,
+        k: int | None = None,
+        filter: SearchFilter | None = None,
+    ) -> list[Document]:
+        self.filters.append(filter)
         metadata: dict[str, Any] = {
             "chunk_id": "chunk-1",
             "doc_id": "doc-a",
@@ -98,6 +107,32 @@ class FakeSearcher:
                 page_content="企业实际发生的与取得收入有关的、合理的支出，准予在计算应纳税所得额时扣除。",
                 metadata=metadata,
             )
+        ]
+
+
+class EmptyFirstSearcher(FakeSearcher):
+    """第一条是空片段：answer 节点过滤后，[1] 应该对应真正有正文的那条。"""
+
+    def search(
+        self,
+        query: str,
+        *,
+        k: int | None = None,
+        filter: SearchFilter | None = None,
+    ) -> list[Document]:
+        documents = super().search(query, k=k, filter=filter)
+        return [
+            Document(
+                page_content="",
+                metadata={
+                    "chunk_id": "chunk-empty",
+                    "doc_id": "doc-a",
+                    "chunk_index": 0,
+                    "page": 0,
+                    "source": "doc-a",
+                },
+            ),
+            *documents,
         ]
 
 
@@ -139,10 +174,10 @@ def make_client(
     return TestClient(fastapi_app)
 
 
-def make_graph(model: Any) -> Any:
+def make_graph(model: Any, *, searcher: Any | None = None) -> Any:
     return build_rag_chat_graph(
         llm=model,
-        searcher=FakeSearcher(),
+        searcher=searcher if searcher is not None else FakeSearcher(),
         resolver=FakeDocumentNameResolver({"doc-a": _FILE_NAME}),
         settings=_SETTINGS,
     )
@@ -299,6 +334,40 @@ def test_chat_returns_answer_and_sources(monkeypatch) -> None:
     assert source["retrieval"] == "hybrid"
     assert source["snippet"].startswith("企业实际发生")
 
+    citation = body["citations"][0]
+    assert citation["index"] == 1
+    assert citation["chunk_id"] == "chunk-1"
+    assert citation["status"] == "weak"
+    assert citation["removed"] is False
+    assert citation["start"] is not None
+    assert body["citation_stats"] == {
+        "total": 1,
+        "ok": 0,
+        "weak": 1,
+        "removed": 0,
+        "invalid": 0,
+        "unsupported": 0,
+    }
+
+
+def test_chat_removes_out_of_range_citation_and_reports_stats(monkeypatch) -> None:
+    model = ScriptedChatModel(responses=[AIMessage(content="扣除项目包括成本 [3]。")])
+    client = make_client(monkeypatch, graph=make_graph(model))
+
+    response = client.post(
+        "/api/rag/chat",
+        json={"message": "企业所得税的扣除项目有哪些？", "thread_id": "t-3"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["answer"] == "扣除项目包括成本。"
+    assert body["citations"][0]["status"] == "invalid"
+    assert body["citations"][0]["reason"] == "out_of_range"
+    assert body["citations"][0]["removed"] is True
+    assert body["citation_stats"]["removed"] == 1
+    assert body["citation_stats"]["invalid"] == 1
+
 
 def test_chat_marks_reranked_sources(monkeypatch) -> None:
     model = ScriptedChatModel(responses=[AIMessage(content="扣除项目包括成本、费用 [1]。")])
@@ -369,3 +438,113 @@ def test_chat_stream_emits_stage_sources_tokens_and_done(monkeypatch) -> None:
     assert done["answer"] == "企业所得税的答案"
     assert done["query"] == "企业所得税怎么算？"
     assert done["sources"][0]["doc_id"] == "doc-a"
+    assert done["citations"] == []
+    assert done["citation_stats"]["total"] == 0
+
+
+def test_chat_stream_done_carries_citations(monkeypatch) -> None:
+    model = StreamingScriptedChatModel(
+        responses=[AIMessage(content="扣除项目包括成本 [1]。")],
+        chunk_size=3,
+    )
+    client = make_client(monkeypatch, graph=make_graph(model))
+
+    response = client.post(
+        "/api/rag/chat/stream",
+        json={"message": "企业所得税的扣除项目有哪些？", "thread_id": "t-4"},
+    )
+
+    done = parse_sse(response.text)[-1][1]
+    assert done["answer"] == "扣除项目包括成本 [1]。"
+    assert done["citations"][0]["index"] == 1
+    assert done["citations"][0]["start"] is not None
+    # 流式 token 里还是模型原文；done 才是校验后的权威答案。
+    assert done["answer"].count("[1]") == 1
+    assert done["citation_stats"]["total"] == 1
+
+
+def test_chat_stream_done_aligns_sources_after_filtering_empty_chunks(monkeypatch) -> None:
+    model = StreamingScriptedChatModel(
+        responses=[AIMessage(content="扣除项目包括成本 [1]。")],
+        chunk_size=4,
+    )
+    client = make_client(monkeypatch, graph=make_graph(model, searcher=EmptyFirstSearcher()))
+
+    response = client.post(
+        "/api/rag/chat/stream",
+        json={"message": "企业所得税的扣除项目有哪些？", "thread_id": "t-5"},
+    )
+
+    done = parse_sse(response.text)[-1][1]
+    assert [source["chunk_id"] for source in done["sources"]] == ["chunk-1"]
+    assert done["citations"][0]["chunk_id"] == "chunk-1"
+
+
+# ---- 文档级过滤（R-01）----------------------------------------------------
+def test_chat_scopes_search_to_requested_documents(monkeypatch) -> None:
+    model = ScriptedChatModel(responses=[AIMessage(content="扣除项目包括成本 [1]。")])
+    searcher = FakeSearcher()
+    client = make_client(monkeypatch, graph=make_graph(model, searcher=searcher))
+
+    response = client.post(
+        "/api/rag/chat",
+        json={
+            "message": "企业所得税的扣除项目有哪些？",
+            "thread_id": "t-filter",
+            "doc_ids": [" doc-a ", "doc-b", "doc-a"],
+        },
+    )
+
+    assert response.status_code == 200
+    # 请求里的 doc_ids 去空白 / 去重后变成类型化过滤条件
+    assert searcher.filters == [SearchFilter(doc_ids=("doc-a", "doc-b"))]
+
+
+def test_chat_without_doc_ids_does_not_filter(monkeypatch) -> None:
+    model = ScriptedChatModel(responses=[AIMessage(content="答案 [1]。")])
+    searcher = FakeSearcher()
+    client = make_client(monkeypatch, graph=make_graph(model, searcher=searcher))
+
+    response = client.post("/api/rag/chat", json={"message": "扣除项目有哪些？"})
+
+    assert response.status_code == 200
+    assert searcher.filters == [None]
+
+
+def test_chat_stream_scopes_search_to_requested_documents(monkeypatch) -> None:
+    model = StreamingScriptedChatModel(responses=[AIMessage(content="答案")], chunk_size=2)
+    searcher = FakeSearcher()
+    client = make_client(monkeypatch, graph=make_graph(model, searcher=searcher))
+
+    response = client.post(
+        "/api/rag/chat/stream",
+        json={"message": "扣除项目有哪些？", "doc_ids": ["doc-a"]},
+    )
+
+    assert response.status_code == 200
+    assert searcher.filters == [SearchFilter(doc_ids=("doc-a",))]
+
+
+def test_chat_rejects_too_many_doc_ids(monkeypatch) -> None:
+    client = make_client(monkeypatch, graph=make_graph(ScriptedChatModel(responses=[])))
+
+    response = client.post(
+        "/api/rag/chat",
+        json={
+            "message": "你好",
+            "doc_ids": [f"doc-{index}" for index in range(MAX_FILTER_DOC_IDS + 1)],
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def test_chat_rejects_overlong_doc_id(monkeypatch) -> None:
+    client = make_client(monkeypatch, graph=make_graph(ScriptedChatModel(responses=[])))
+
+    response = client.post(
+        "/api/rag/chat",
+        json={"message": "你好", "doc_ids": ["x" * 65]},
+    )
+
+    assert response.status_code == 422

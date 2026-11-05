@@ -10,12 +10,15 @@
   「业务招待费的扣除标准是什么？」这种可独立检索的问题；首轮直接使用原问题，
   不额外消耗一次模型调用。
 * ``retrieve``：委托 `MilvusChunkSearcher` 在 ``rag_chunk`` 上做混合检索，
-  融合结果再交给可选的精排模型（``qwen3.7-text-rerank``）重新打分。
+  融合结果再交给可选的精排模型（``qwen3.7-text-rerank``）重新打分。请求带了
+  ``doc_ids`` 时，过滤表达式会下传给三路检索，只在指定文档内召回。
 * ``resolve``：Milvus 里只有 ``doc_id``，这里按 ``doc_id`` 批量回查 MySQL
   ``tb_document_parse_job`` 的文件名，写回 ``metadata["source"]``；查不到就
   退回 ``doc_id``，不影响问答。
 * ``answer``：把召回片段按 ``[1] [2]`` 编号拼进提示词，来源就是上一步补好的
-  文件名；没有召回时**不调用 LLM**，直接返回兜底文案（省钱、避免幻觉）。
+  文件名；没有召回时**不调用 LLM**，直接返回兜底文案（省钱、避免幻觉）。生成后由
+  `rag.citations.verify_citations` 做存在性 / 数字归一化 / 支持度校验：越界或数字
+  冲突的编号会从答案里删除并记入 ``citation_stats``，低重合只标 ``weak``。
 
 多轮上下文由 LangGraph 的 checkpointer 保存，API 层为每个 ``thread_id`` 建一条会话。
 """
@@ -38,12 +41,19 @@ from langgraph.graph.message import add_messages
 from ai_agent_py.config import Settings, get_settings
 from ai_agent_py.graph.agent import message_text
 from ai_agent_py.llm import get_chat_model
-from ai_agent_py.rag.chain import format_documents, normalize_citations
+from ai_agent_py.rag.chain import format_documents
+from ai_agent_py.rag.citations import (
+    Citation,
+    CitationStats,
+    strip_citations,
+    verify_citations,
+)
 from ai_agent_py.rag.doc_names import (
     DocumentNameResolver,
     MySQLDocumentNameResolver,
     apply_document_names,
 )
+from ai_agent_py.rag.filters import SearchFilter
 from ai_agent_py.rag.milvus_search import DocumentSearcher, get_milvus_searcher
 
 if TYPE_CHECKING:
@@ -124,6 +134,12 @@ class RagChatState(TypedDict, total=False):
     query: str
     documents: list[Document]
     answer: str
+    #: 本轮答案的引用校验结果（`rag.citations.Citation.as_dict()`）。
+    citations: list[dict[str, Any]]
+    citation_stats: dict[str, int]
+    #: 本轮只在这些文档内检索（空 = 全库）；每轮必须显式传入，否则会沿用
+    #: checkpointer 里上一轮的范围。
+    doc_ids: list[str]
 
 
 @dataclass(slots=True)
@@ -133,6 +149,8 @@ class RagChatTurn:
     answer: str
     query: str = ""
     documents: list[Document] = field(default_factory=list)
+    citations: list[Citation] = field(default_factory=list)
+    citation_stats: CitationStats = field(default_factory=CitationStats)
 
 
 # ---- 节点 -----------------------------------------------------------------
@@ -168,7 +186,7 @@ def build_condense_node(
 def build_retrieve_node(
     searcher: DocumentSearcher,
 ) -> Callable[[RagChatState], Any]:
-    """在 ``rag_chunk`` 上检索与 ``query`` 相关的片段。"""
+    """在 ``rag_chunk`` 上检索与 ``query`` 相关的片段（可按 ``doc_ids`` 限定范围）。"""
 
     def retrieve(state: RagChatState) -> dict[str, Any]:
         """节点：在 ``rag_chunk`` 上检索与 query 相关的片段。"""
@@ -176,7 +194,16 @@ def build_retrieve_node(
         if not query:
             messages = list(state.get("messages") or [])
             query = message_text(messages[-1]).strip() if messages else ""
-        documents = searcher.search(query) if query else []
+        if not query:
+            return {"query": "", "documents": []}
+
+        search_filter = SearchFilter.from_doc_ids(state.get("doc_ids") or [])
+        # 没有过滤条件时不传 filter：老的自定义检索器（只认 query / k）照样能用。
+        documents = (
+            searcher.search(query, filter=search_filter)
+            if search_filter is not None
+            else searcher.search(query)
+        )
         return {"query": query, "documents": list(documents)}
 
     return retrieve
@@ -214,6 +241,9 @@ def build_answer_node(
             return {
                 "answer": NO_CONTEXT_ANSWER,
                 "messages": [AIMessage(content=NO_CONTEXT_ANSWER)],
+                "documents": [],
+                "citations": [],
+                "citation_stats": CitationStats().as_dict(),
             }
 
         history = _history(messages[:-1])[-max_history:]
@@ -231,15 +261,23 @@ def build_answer_node(
         )
         response = llm.invoke(prompt_messages)
         text = message_text(response).strip() or NO_CONTEXT_ANSWER
-        # 兜底：模型偶尔把法条序号当来源编号（[43]），用本轮片段反查真实来源。
-        text, fixed = normalize_citations(text, documents)
-        if fixed:
+        report = verify_citations(text, documents)
+        if report.stats.removed:
             logger.warning(
-                "回答里出现越界引用 %s（本轮资料 %d 条），已按正文校正",
-                fixed,
-                len(documents),
+                "回答引用校验：移除 %d 处（越界 %d / 数字不一致 %d），弱支持 %d 处",
+                report.stats.removed,
+                report.stats.invalid,
+                report.stats.unsupported,
+                report.stats.weak,
             )
-        return {"answer": text, "messages": [AIMessage(content=text)]}
+        return {
+            "answer": report.answer,
+            "messages": [AIMessage(content=report.answer)],
+            # 过滤掉空片段后写回，保证 sources[n-1] 与答案里的 [n] 严格对应。
+            "documents": documents,
+            "citations": [citation.as_dict() for citation in report.citations],
+            "citation_stats": report.stats.as_dict(),
+        }
 
     return answer
 
@@ -303,29 +341,54 @@ def ask_rag_chat(
     message: str,
     *,
     thread_id: str | None = None,
+    doc_ids: Sequence[str] | None = None,
 ) -> RagChatTurn:
-    """同步跑一轮问答；``thread_id`` 相同则复用 checkpointer 里的历史。"""
+    """同步跑一轮问答；``thread_id`` 相同则复用 checkpointer 里的历史。
+
+    ``doc_ids`` 非空时只在指定文档内检索。**每轮都会写回该键**（未指定就是
+    空列表），避免多轮对话沿用上一轮的过滤范围。
+    """
     config: RunnableConfig = (
         rag_chat_config(thread_id=thread_id)
         if thread_id
         else {"recursion_limit": RAG_CHAT_RECURSION_LIMIT}
     )
-    result = graph.invoke({"messages": [HumanMessage(content=message)]}, config)
+    result = graph.invoke(
+        {
+            "messages": [HumanMessage(content=message)],
+            "doc_ids": list(doc_ids or ()),
+        },
+        config,
+    )
+    citations = [Citation.from_dict(item) for item in (result.get("citations") or [])]
+    stats = CitationStats(**(result.get("citation_stats") or {}))
     return RagChatTurn(
         answer=str(result.get("answer") or ""),
         query=str(result.get("query") or ""),
         documents=list(result.get("documents") or []),
+        citations=citations,
+        citation_stats=stats,
     )
 
 
 # ---- 历史与文本处理 -------------------------------------------------------
 def _history(messages: Sequence[AnyMessage]) -> list[AnyMessage]:
-    """只保留有正文的人机消息（工具消息、空消息不进提示词）。"""
+    """只保留有正文的人机消息（工具消息、空消息不进提示词）。
+
+    ``ai`` 消息里的 ``[n]`` 属于**上一轮**的资料编号，直接带进下一轮会和本轮重新
+    编号冲突（D-01），所以进提示词前统一剥掉；法条文本本身不受影响。
+    """
     kept: list[AnyMessage] = []
     for message in messages:
         if message.type not in {"human", "ai"}:
             continue
-        if message_text(message).strip():
+        text = message_text(message)
+        if message.type == "ai":
+            text = strip_citations(text)
+            if text.strip():
+                kept.append(AIMessage(content=text))
+            continue
+        if text.strip():
             kept.append(message)
     return kept
 

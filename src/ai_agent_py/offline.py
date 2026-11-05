@@ -20,6 +20,8 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 
+from ai_agent_py.rag.filters import SearchFilter
+
 
 class StaticChatModel(BaseChatModel):
     """A chat model that always replies with the same text (offline demo)."""
@@ -81,8 +83,10 @@ class OfflineChunkSearcher:
     同时实现两个协议，行为和 Milvus 那条链路对齐：
 
     * `rag.ingest.ChunkWriter`：``index_document(doc_id, chunks)`` 按 ``doc_id`` 覆盖写入；
-    * `rag.milvus_search.DocumentSearcher`：``search(query, k=...)`` 按余弦相似度取前 k 条，
-      返回的 ``Document.metadata`` 带 ``doc_id`` / ``chunk_id`` / ``chunk_index`` / ``source``。
+    * `rag.milvus_search.DocumentSearcher`：``search(query, k=..., filter=...)`` 按余弦
+      相似度取前 k 条，``filter`` 按 ``doc_ids`` 过滤（与 Milvus 链路同一套
+      `SearchFilter`），返回的 ``Document.metadata`` 带 ``doc_id`` / ``chunk_id`` /
+      ``chunk_index`` / ``source``。
     """
 
     collection = "memory"
@@ -114,15 +118,23 @@ class OfflineChunkSearcher:
         for key in [key for key in self._items if key.startswith(prefix)]:
             self._items.pop(key, None)
 
-    def search(self, query: str, *, k: int | None = None) -> list[Document]:
+    def search(
+        self,
+        query: str,
+        *,
+        k: int | None = None,
+        filter: SearchFilter | None = None,
+    ) -> list[Document]:
         """按余弦相似度返回前 ``k`` 条（向量已归一化，点积即余弦）。"""
         text = (query or "").strip()
         if not text or not self._items:
             return []
         vector = self.embeddings.embed_query(text)
+        wanted = frozenset(filter.doc_ids) if filter is not None else frozenset()
         scored = [
             (sum(left * right for left, right in zip(vector, stored, strict=True)), document)
             for document, stored in self._items.values()
+            if not wanted or str(document.metadata.get("doc_id") or "") in wanted
         ]
         scored.sort(key=lambda pair: pair[0], reverse=True)
         limit = max(1, k or self.default_k)

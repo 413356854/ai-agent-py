@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field
+
+from ai_agent_py.rag.filters import MAX_DOC_ID_LENGTH, MAX_FILTER_DOC_IDS
 
 #: 单次入库最多接受的切片数：防止误传超大数组把 embedding 请求撑爆。
 MAX_INGEST_CHUNKS = 20_000
@@ -168,6 +170,14 @@ class RagChatRequest(BaseModel):
         max_length=64,
         description="会话 ID：相同 id 复用 LangGraph checkpointer 里的多轮上下文",
     )
+    doc_ids: list[Annotated[str, Field(max_length=MAX_DOC_ID_LENGTH)]] = Field(
+        default_factory=list,
+        max_length=MAX_FILTER_DOC_IDS,
+        description=(
+            "只在指定文档内检索（rag_chunk.doc_id）；空数组表示全库。"
+            "多轮对话每轮都要带上；未带的轮次按全库检索，不会沿用上一轮的范围"
+        ),
+    )
 
 
 class RagSourceOut(BaseModel):
@@ -185,6 +195,34 @@ class RagSourceOut(BaseModel):
     snippet: str = ""
 
 
+class RagCitationOut(BaseModel):
+    """答案里的一条引用及其校验结果。"""
+
+    index: int = Field(description="对应的来源序号（1 开始）；越界时保留原编号")
+    chunk_id: str = ""
+    doc_id: str = ""
+    quote: str = Field(default="", description="答案里原来的方括号文本，例如 [2]")
+    start: int | None = Field(default=None, description="答案内字符起点；被移除时为 null")
+    end: int | None = Field(default=None, description="答案内字符终点（不含）；被移除时为 null")
+    status: Literal["ok", "weak", "invalid", "unsupported"] = Field(
+        default="ok",
+        description="ok=通过；weak=支持度弱但保留；invalid=编号越界/空片段；unsupported=数字冲突",
+    )
+    reason: str = Field(default="", description="判定原因：out_of_range / numeric_mismatch 等")
+    removed: bool = Field(default=False, description="是否已从答案正文中删除")
+
+
+class RagCitationStatsOut(BaseModel):
+    """一次回答的引用统计；``total == ok + weak + removed``。"""
+
+    total: int = 0
+    ok: int = 0
+    weak: int = 0
+    removed: int = 0
+    invalid: int = 0
+    unsupported: int = 0
+
+
 class RagChatResponse(BaseModel):
     """非流式问答响应。"""
 
@@ -192,3 +230,7 @@ class RagChatResponse(BaseModel):
     thread_id: str
     query: str = Field(default="", description="实际用于检索的问题（多轮追问会被改写）")
     sources: list[RagSourceOut] = Field(default_factory=list)
+    citations: list[RagCitationOut] = Field(
+        default_factory=list, description="答案里的引用与校验结果（含已移除的条目）"
+    )
+    citation_stats: RagCitationStatsOut = Field(default_factory=RagCitationStatsOut)

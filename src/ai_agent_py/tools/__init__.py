@@ -13,6 +13,7 @@ write outside the project by accident.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -20,6 +21,7 @@ from langchain_core.tools import BaseTool, tool
 
 from ai_agent_py.config import Settings
 from ai_agent_py.rag.chain import format_documents
+from ai_agent_py.rag.filters import SearchFilter
 from ai_agent_py.tools.filesystem import build_filesystem_tools
 from ai_agent_py.tools.shell import build_shell_tool
 from ai_agent_py.tools.web_extractor import build_web_extractor_tool
@@ -43,6 +45,7 @@ __all__ = [
 KNOWLEDGE_TOOL_NAME = "search_knowledge_base"
 KNOWLEDGE_TOOL_DESCRIPTION = (
     "在内部知识库中做向量检索，返回与查询最相关的文档片段（带 [编号] 和来源）。"
+    "可用 doc_ids 把检索限定在指定文档内（不传则按默认范围检索）。"
     "任何关于公司制度、产品资料、文档细节的事实性问题，都应先调用本工具。"
 )
 
@@ -52,13 +55,33 @@ def build_knowledge_tool(
     *,
     name: str = KNOWLEDGE_TOOL_NAME,
     description: str = KNOWLEDGE_TOOL_DESCRIPTION,
+    default_doc_ids: Sequence[str] = (),
 ) -> BaseTool:
-    """Wrap the Milvus knowledge base as a LangChain tool the LLM can call."""
+    """Wrap the Milvus knowledge base as a LangChain tool the LLM can call.
+
+    ``default_doc_ids`` 可把工具固定在几篇文档内（例如按业务线拆分知识库）；
+    模型调用时仍可用 ``doc_ids`` 覆盖本次检索范围，不传则用这个默认值。
+    """
+    default_filter = SearchFilter.from_doc_ids(default_doc_ids)
 
     @tool(name, description=description)
-    def search_knowledge_base(query: str) -> str:
-        """在内部知识库中检索与 query 相关的文档片段。"""
-        documents = list(searcher.search(query))
+    def search_knowledge_base(query: str, doc_ids: list[str] | None = None) -> str:
+        """在内部知识库中检索与 query 相关的文档片段。
+
+        Args:
+            query: 检索问题或关键词。
+            doc_ids: 只在这些文档 id 内检索；不传则使用工具默认范围（未配置时全库）。
+        """
+        # 模型没给有效范围时退回默认范围（不能因为传了空数组就把限定范围放开）。
+        search_filter = SearchFilter.from_doc_ids(doc_ids) if doc_ids else None
+        if search_filter is None:
+            search_filter = default_filter
+        # 没有过滤条件时不传 filter：保持与只实现 search(query, k=...) 的检索器兼容。
+        documents = (
+            searcher.search(query, filter=search_filter)
+            if search_filter is not None
+            else searcher.search(query)
+        )
         if not documents:
             return "未检索到相关资料。"
         return format_documents(documents)

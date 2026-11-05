@@ -38,6 +38,8 @@ def test_query_returns_answer_and_sources(
     assert body["answer"] == "答案来自知识库"
     assert body["sources"]
     assert {"index", "source", "page", "snippet"} <= set(body["sources"][0])
+    assert body["citations"] == []
+    assert body["citation_stats"]["total"] == 0
 
 
 def test_query_validates_empty_question(monkeypatch, settings, searcher) -> None:

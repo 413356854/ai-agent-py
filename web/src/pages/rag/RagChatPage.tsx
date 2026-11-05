@@ -4,6 +4,7 @@ import {
   BulbOutlined,
   DatabaseOutlined,
   DeleteOutlined,
+  FilterOutlined,
   ReloadOutlined,
   RobotOutlined,
   SendOutlined,
@@ -16,6 +17,7 @@ import {
   Empty,
   Input,
   Popover,
+  Select,
   Space,
   Spin,
   Tag,
@@ -25,7 +27,7 @@ import {
 import { useNavigate } from 'react-router-dom'
 import { ApiError, api } from '../../api/client'
 import { MarkdownPreview } from '../../components/MarkdownPreview'
-import type { RagOverview, RagSource } from '../../types'
+import type { RagCitation, RagCitationStats, RagOverview, RagSource } from '../../types'
 
 type MessageStatus = 'loading' | 'streaming' | 'done' | 'error' | 'stopped'
 
@@ -35,6 +37,8 @@ interface ChatMessage {
   content: string
   status: MessageStatus
   sources: RagSource[]
+  citations: RagCitation[]
+  citationStats: RagCitationStats | null
   query?: string
   stage?: string
   error?: string
@@ -61,6 +65,31 @@ function sourceLabel(source: RagSource): string {
   return source.source.length > 26 ? `${source.source.slice(0, 26)}…` : source.source
 }
 
+/**
+ * 按后端给的 span 把正文里的 `[n]` 换成 Markdown 链接，避免正则误伤普通方括号。
+ * 链接交给 MarkdownPreview 渲染成可点击的 <sup>。
+ */
+function withCitationLinks(answer: string, citations: RagCitation[]): string {
+  const linked = citations
+    .filter(
+      (citation) =>
+        !citation.removed && citation.start != null && citation.end != null,
+    )
+    .sort((left, right) => (left.start ?? 0) - (right.start ?? 0))
+  if (!linked.length) return answer
+
+  let result = ''
+  let cursor = 0
+  for (const citation of linked) {
+    const start = citation.start ?? 0
+    const end = citation.end ?? start
+    if (start < cursor || end > answer.length) continue
+    result += `${answer.slice(cursor, start)}[[${citation.index}]](#rag-cite-${citation.index})`
+    cursor = end
+  }
+  return result + answer.slice(cursor)
+}
+
 interface MessageItemProps {
   message: ChatMessage
   onOpenRecords: (docId: string) => void
@@ -68,6 +97,45 @@ interface MessageItemProps {
 
 /** 单条消息：流式回答只更新最后一条，memo 避免历史消息反复重渲染 Markdown。 */
 const MessageItem = memo(function MessageItem({ message, onOpenRecords }: MessageItemProps) {
+  const [activeCite, setActiveCite] = useState<number | null>(null)
+  const sourceRefs = useRef(new Map<number, HTMLSpanElement>())
+  const flashTimer = useRef<number | null>(null)
+  const citations = message.citations
+  const stats = message.citationStats
+  const cited = useMemo(
+    () =>
+      new Set(
+        citations.filter((citation) => !citation.removed).map((citation) => citation.index),
+      ),
+    [citations],
+  )
+  const weak = useMemo(
+    () =>
+      new Set(
+        citations
+          .filter((citation) => citation.status === 'weak')
+          .map((citation) => citation.index),
+      ),
+    [citations],
+  )
+  const markdown = useMemo(
+    () => withCitationLinks(message.content, citations),
+    [citations, message.content],
+  )
+
+  useEffect(() => {
+    return () => {
+      if (flashTimer.current !== null) window.clearTimeout(flashTimer.current)
+    }
+  }, [])
+
+  const focusSource = useCallback((index: number) => {
+    setActiveCite(index)
+    sourceRefs.current.get(index)?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    if (flashTimer.current !== null) window.clearTimeout(flashTimer.current)
+    flashTimer.current = window.setTimeout(() => setActiveCite(null), 1800)
+  }, [])
+
   if (message.role === 'user') {
     return (
       <div className="chat-msg chat-msg-user">
@@ -94,7 +162,9 @@ const MessageItem = memo(function MessageItem({ message, onOpenRecords }: Messag
       </div>
       <div className="chat-body">
         <div className="chat-bubble">
-          {message.content ? <MarkdownPreview markdown={message.content} assetsBase="" /> : null}
+          {message.content ? (
+            <MarkdownPreview markdown={markdown} assetsBase="" onCitationClick={focusSource} />
+          ) : null}
           {waiting && (
             <div className="chat-loading">
               <Spin size="small" />
@@ -127,6 +197,7 @@ const MessageItem = memo(function MessageItem({ message, onOpenRecords }: Messag
             <Space size={8} wrap>
               <Typography.Text type="secondary" style={{ fontSize: 12 }}>
                 引用片段（{message.sources.length}）
+                {cited.size > 0 ? ` · 已引用 ${cited.size}` : ''}
                 {message.sources.some((source) => source.reranked) ? ' · 已精排' : ''}
               </Typography.Text>
               {message.query && (
@@ -135,26 +206,52 @@ const MessageItem = memo(function MessageItem({ message, onOpenRecords }: Messag
                 </Typography.Text>
               )}
             </Space>
+            {stats && stats.removed > 0 && (
+              <Tooltip
+                title={`编号越界 ${stats.invalid} 处 · 数字与资料不一致 ${stats.unsupported} 处`}
+              >
+                <Typography.Text type="warning" style={{ fontSize: 12 }}>
+                  已移除 {stats.removed} 处无法核实的引用编号
+                </Typography.Text>
+              </Tooltip>
+            )}
             <Space size={[6, 6]} wrap>
               {message.sources.map((source) => (
-                <Popover
+                <span
                   key={`${source.chunk_id}-${source.index}`}
-                  placement="top"
-                  title={
-                    <span className="chat-source-title">
-                      [{source.index}] {source.source}
-                      {source.page ? ` · 第 ${source.page} 页` : ''} · 块 #
-                      {source.chunk_index + 1}
-                      {source.score != null ? ` · 相关度 ${source.score.toFixed(3)}` : ''}
-                    </span>
+                  ref={(element) => {
+                    if (element) sourceRefs.current.set(source.index, element)
+                    else sourceRefs.current.delete(source.index)
+                  }}
+                  className={
+                    activeCite === source.index
+                      ? 'chat-source-anchor chat-source-hit'
+                      : 'chat-source-anchor'
                   }
-                  content={<div className="chat-source-pop">{source.snippet}</div>}
                 >
-                  <Tag className="chat-source-tag" icon={<DatabaseOutlined />}>
-                    [{source.index}] {sourceLabel(source)}
-                    {source.page ? ` · p.${source.page}` : ''}
-                  </Tag>
-                </Popover>
+                  <Popover
+                    placement="top"
+                    title={
+                      <span className="chat-source-title">
+                        [{source.index}] {source.source}
+                        {source.page ? ` · 第 ${source.page} 页` : ''} · 块 #
+                        {source.chunk_index + 1}
+                        {source.score != null ? ` · 相关度 ${source.score.toFixed(3)}` : ''}
+                        {weak.has(source.index) ? ' · 支持度较弱' : ''}
+                      </span>
+                    }
+                    content={<div className="chat-source-pop">{source.snippet}</div>}
+                  >
+                    <Tag
+                      className="chat-source-tag"
+                      icon={<DatabaseOutlined />}
+                      color={weak.has(source.index) ? 'orange' : undefined}
+                    >
+                      [{source.index}] {sourceLabel(source)}
+                      {source.page ? ` · p.${source.page}` : ''}
+                    </Tag>
+                  </Popover>
+                </span>
               ))}
               {docId && (
                 <Button type="link" size="small" onClick={() => onOpenRecords(docId)}>
@@ -175,6 +272,7 @@ export function RagChatPage() {
   const [threadId, setThreadId] = useState(newId)
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [input, setInput] = useState('')
+  const [docIds, setDocIds] = useState<string[]>([])
   const [streaming, setStreaming] = useState(false)
   const [overview, setOverview] = useState<RagOverview | null>(null)
   const [overviewError, setOverviewError] = useState('')
@@ -240,8 +338,24 @@ export function RagChatPage() {
       const assistantId = newId()
       setMessages((previous) => [
         ...previous,
-        { id: newId(), role: 'user', content, status: 'done', sources: [] },
-        { id: assistantId, role: 'assistant', content: '', status: 'loading', sources: [] },
+        {
+          id: newId(),
+          role: 'user',
+          content,
+          status: 'done',
+          sources: [],
+          citations: [],
+          citationStats: null,
+        },
+        {
+          id: assistantId,
+          role: 'assistant',
+          content: '',
+          status: 'loading',
+          sources: [],
+          citations: [],
+          citationStats: null,
+        },
       ])
       setInput('')
       setStreaming(true)
@@ -253,6 +367,7 @@ export function RagChatPage() {
         await api.ragChatStream(
           content,
           threadId,
+          docIds,
           {
             onStage: (stage, stageMessage) =>
               patchMessage(assistantId, (current) => ({
@@ -273,12 +388,14 @@ export function RagChatPage() {
                 content: current.content + token,
                 status: 'streaming',
               })),
-            onDone: ({ answer, query, sources }) =>
+            onDone: ({ answer, query, sources, citations, citation_stats }) =>
               patchMessage(assistantId, (current) => ({
                 ...current,
                 content: answer || current.content,
                 query: query || current.query,
                 sources: sources.length ? sources : current.sources,
+                citations,
+                citationStats: citation_stats,
                 status: 'done',
               })),
             onError: (detail) =>
@@ -314,7 +431,7 @@ export function RagChatPage() {
         abortRef.current = null
       }
     },
-    [patchMessage, streaming, threadId],
+    [docIds, patchMessage, streaming, threadId],
   )
 
   const stop = () => {
@@ -429,7 +546,7 @@ export function RagChatPage() {
               </div>
               <Typography.Title level={4}>向知识库提问</Typography.Title>
               <Typography.Paragraph type="secondary" style={{ maxWidth: 640 }}>
-                回答只基于已入库的切片；点击引用编号可以查看命中的原文片段。多轮追问会结合上文自动改写检索问题。
+                回答只基于已入库的切片；点击回答里的引用编号，会定位到下方对应的来源片段。编号越界或与资料数字不一致的引用会被移除并提示。多轮追问会结合上文自动改写检索问题。
               </Typography.Paragraph>
               <Space wrap className="chat-examples">
                 {examples.map((example) => (
@@ -449,6 +566,35 @@ export function RagChatPage() {
               <MessageItem key={message.id} message={message} onOpenRecords={openRecords} />
             ))
           )}
+        </div>
+
+        <div className="chat-scope">
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            <FilterOutlined /> 检索范围
+          </Typography.Text>
+          <Tooltip title="只在这些文档的切片里检索；不选则检索全部已入库文档">
+            <Select
+              mode="multiple"
+              allowClear
+              showSearch
+              optionFilterProp="label"
+              maxTagCount="responsive"
+              size="small"
+              className="chat-scope-select"
+              placeholder="全部文档"
+              value={docIds}
+              disabled={!overview?.ready}
+              loading={loadingStatus}
+              onChange={(values: string[]) => setDocIds(values)}
+              options={(overview?.docs ?? []).map((doc) => ({
+                value: doc.doc_id,
+                label: `${doc.file_name ?? doc.doc_id}（${doc.chunks} 块）`,
+              }))}
+            />
+          </Tooltip>
+          <Typography.Text type="secondary" className="chat-scope-hint">
+            {docIds.length > 0 ? `本轮只在这 ${docIds.length} 篇文档内检索` : '默认检索全部文档'}
+          </Typography.Text>
         </div>
 
         <div className="chat-composer">
