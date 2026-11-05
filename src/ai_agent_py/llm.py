@@ -22,8 +22,12 @@ def get_chat_model(
     *,
     streaming: bool = False,
     temperature: float | None = None,
+    model: str | None = None,
 ) -> BaseChatModel:
-    """Build the chat model used by the RAG chain and the agent."""
+    """Build the chat model used by the RAG chain and the agent.
+
+    ``model`` 可覆盖 ``LLM_MODEL``，用于通用 Agent 单独指定支持视觉的模型。
+    """
     cfg = settings or get_settings()
     api_key = cfg.resolved_llm_api_key
     if not api_key:
@@ -34,7 +38,7 @@ def get_chat_model(
         )
 
     kwargs: dict[str, Any] = {
-        "model": cfg.llm_model,
+        "model": model or cfg.llm_model,
         "api_key": api_key,
         "temperature": cfg.llm_temperature if temperature is None else temperature,
         "timeout": cfg.llm_timeout,

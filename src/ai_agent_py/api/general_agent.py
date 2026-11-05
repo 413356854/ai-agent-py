@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import lru_cache
 from typing import TYPE_CHECKING, Annotated, Any, cast
+from urllib.parse import unquote, urlsplit
 
 from fastapi import APIRouter, HTTPException, Query, Response
 from fastapi.responses import StreamingResponse
@@ -43,6 +44,7 @@ from langchain_core.messages import (
 )
 from pydantic import BaseModel, Field
 
+from ai_agent_py.alioss.service import OssImageService
 from ai_agent_py.config import Settings, get_settings
 from ai_agent_py.db.agent_chat import (
     DEFAULT_AGENT_ID,
@@ -55,7 +57,7 @@ from ai_agent_py.db.agent_chat import (
     ChatSummary,
     MySQLChatMemoryStore,
 )
-from ai_agent_py.errors import AiAgentError, ConfigurationError
+from ai_agent_py.errors import AiAgentError, ConfigurationError, OssError
 from ai_agent_py.general.agent import (
     GENERAL_AGENT_SYSTEM_PROMPT,
     build_general_agent_graph,
@@ -106,7 +108,8 @@ def _tools() -> list[BaseTool]:
 @lru_cache(maxsize=1)
 def _chat_model() -> BaseChatModel:
     # streaming=True：ChatOpenAI 走流式，SSE 才能逐 token 输出；摘要调用也用同一个模型。
-    return get_chat_model(get_settings(), streaming=True)
+    cfg = get_settings()
+    return get_chat_model(cfg, streaming=True, model=cfg.general_agent_model)
 
 
 @lru_cache(maxsize=1)
@@ -242,6 +245,65 @@ class ChatRequest(BaseModel):
         max_length=64,
         description="会话 ID；留空由服务端生成（响应里返回）",
     )
+    images: list[str] = Field(
+        default_factory=list,
+        max_length=9,
+        description="已上传到私域 OSS 的图片直链（最多 9 张）；会以 Markdown 图片链接写入会话",
+    )
+
+
+MAX_CHAT_IMAGES = 9
+
+
+def _image_urls(payload: ChatRequest) -> list[str]:
+    """校验图片直链（本站 Bucket + OSS_PREFIX），返回去重后的 URL。"""
+    if not payload.images:
+        return []
+
+    cfg = get_settings()
+    service = OssImageService(cfg)
+    urls: list[str] = []
+    for raw in payload.images:
+        value = (raw or "").strip()
+        if not value:
+            continue
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise HTTPException(status_code=400, detail="图片地址必须是 http(s) URL")
+        if not cfg.oss_host or parsed.hostname != cfg.oss_host:
+            raise HTTPException(status_code=400, detail="图片地址必须来自本站私域 OSS 的 Bucket")
+        key = unquote(parsed.path).lstrip("/")
+        try:
+            service.normalize_key(key)
+        except OssError as exc:
+            raise HTTPException(status_code=400, detail=f"图片地址不合法：{exc}") from exc
+        if value not in urls:
+            urls.append(value)
+
+    if len(urls) > MAX_CHAT_IMAGES:
+        raise HTTPException(status_code=400, detail=f"一次最多发送 {MAX_CHAT_IMAGES} 张图片")
+    return urls
+
+
+def _user_text(message: str, urls: list[str]) -> str:
+    """落库 / 界面回放用的文本：文字 + Markdown 图片链接。"""
+    if not urls:
+        return message
+    gallery = "\n".join(f"![用户上传的图片]({url})" for url in urls)
+    return f"{message}\n\n{gallery}"
+
+
+def _human_content(message: str, urls: list[str]) -> str | list[Any]:
+    """发给模型的内容：有图片时按 LangChain 标准 content block 组装。
+
+    标准格式来自官方文档：``{"type": "image", "url": "..."}``；
+    ``ChatOpenAI`` 等集成会自动转换成 provider 原生的 ``image_url`` 结构。
+    """
+    if not urls:
+        return message
+    blocks: list[Any] = [{"type": "text", "text": message}]
+    blocks.extend({"type": "image", "url": url} for url in urls)
+    return blocks
 
 
 class ChatResponse(BaseModel):
@@ -323,7 +385,7 @@ def overview() -> OverviewOut:
     )
     return OverviewOut(
         ready=llm_configured and memory.ok,
-        llm_model=cfg.llm_model,
+        llm_model=cfg.general_agent_model or cfg.llm_model,
         llm_configured=llm_configured,
         max_turns=cfg.agent_max_turns,
         workspace=str(cfg.agent_workspace),
@@ -502,6 +564,9 @@ def chat(payload: ChatRequest) -> ChatResponse:
     graph = _graph_or_503()
     store = _store_or_503()
     thread_id = _thread_id(payload.thread_id)
+    image_urls = _image_urls(payload)
+    content = _user_text(payload.message, image_urls)
+    model_content = _human_content(payload.message, image_urls)
     started = time.perf_counter()
 
     try:
@@ -510,7 +575,7 @@ def chat(payload: ChatRequest) -> ChatResponse:
         user_seq = context.last_seq + 1
         session = store.append_messages(
             thread_id,
-            [ChatMessage(role="user", content=payload.message)],
+            [ChatMessage(role="user", content=content)],
             title=payload.message,
         )
     except AiAgentError as exc:
@@ -518,7 +583,7 @@ def chat(payload: ChatRequest) -> ChatResponse:
 
     prompt_messages: list[AnyMessage] = [
         *context.messages,
-        HumanMessage(content=payload.message),
+        HumanMessage(content=model_content),
     ]
     try:
         result = _invoke_graph(graph, prompt_messages, context.summary, cfg)
@@ -536,7 +601,7 @@ def chat(payload: ChatRequest) -> ChatResponse:
                 )
                 prompt_messages = [
                     *context.messages,
-                    HumanMessage(content=payload.message),
+                    HumanMessage(content=model_content),
                 ]
                 result = _invoke_graph(graph, prompt_messages, context.summary, cfg)
             except Exception as retry_exc:
@@ -601,6 +666,9 @@ def _stream_events(
     """把 LangGraph 的 messages / updates 流翻译成前端消费的 SSE 事件。"""
     started = time.perf_counter()
     thread_id = _thread_id(payload.thread_id)
+    image_urls = _image_urls(payload)
+    content = _user_text(payload.message, image_urls)
+    model_content = _human_content(payload.message, image_urls)
 
     # 先把用户消息落库：即使模型报错，刷新后这一句也还在会话里。
     try:
@@ -609,7 +677,7 @@ def _stream_events(
         user_seq = context.last_seq + 1
         session = store.append_messages(
             thread_id,
-            [ChatMessage(role="user", content=payload.message)],
+            [ChatMessage(role="user", content=content)],
             title=payload.message,
         )
     except AiAgentError as exc:
@@ -622,7 +690,7 @@ def _stream_events(
 
     prompt_messages: list[AnyMessage] = [
         *context.messages,
-        HumanMessage(content=payload.message),
+        HumanMessage(content=model_content),
     ]
     call_meta: dict[str, dict[str, Any]] = {}
     tool_started: dict[str, float] = {}
@@ -744,7 +812,7 @@ def _stream_events(
                     return
                 prompt_messages = [
                     *context.messages,
-                    HumanMessage(content=payload.message),
+                    HumanMessage(content=model_content),
                 ]
                 if context.stats.summarized_messages:
                     yield _sse(

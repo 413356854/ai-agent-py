@@ -17,6 +17,10 @@ import type {
   DocumentConfig,
   GeneralAgentOverview,
   MarkdownOut,
+  OssImage,
+  OssObjectList,
+  OssOverview,
+  OssPresign,
   ParseJob,
   RagChatResponse,
   RagChatStreamHandlers,
@@ -68,6 +72,13 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     return undefined as T
   }
   return (await response.json()) as T
+}
+
+function encodeOssKey(key: string): string {
+  return key
+    .split('/')
+    .map((part) => encodeURIComponent(part))
+    .join('/')
 }
 
 export const api = {
@@ -241,11 +252,11 @@ export const api = {
     ),
 
   /** 非流式对话；页面用 `generalChatStream` 逐 token 显示并实时展示工具调用。 */
-  generalChat: (message: string, threadId: string) =>
+  generalChat: (message: string, threadId: string, images: string[] = []) =>
     request<AgentChatResponse>('/api/general-agent/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message, thread_id: threadId }),
+      body: JSON.stringify({ message, thread_id: threadId, images }),
     }),
 
   generalChatStream: (
@@ -253,7 +264,33 @@ export const api = {
     threadId: string,
     handlers: AgentChatStreamHandlers,
     signal?: AbortSignal,
-  ) => streamGeneralChat(message, threadId, handlers, signal),
+    images: string[] = [],
+  ) => streamGeneralChat(message, threadId, handlers, signal, images),
+
+  /* ---- 私域 OSS（阿里云私有 Bucket：上传 / 读取 / 列举 / 删除）-------- */
+  ossOverview: () => request<OssOverview>('/api/oss/overview'),
+
+  /** 上传图片；返回 OSS 直链（预览 + 附件下载）。 */
+  ossUpload: (file: File) => {
+    const form = new FormData()
+    form.append('file', file)
+    return request<OssImage>('/api/oss/images', {
+      method: 'POST',
+      body: form,
+    })
+  },
+
+  /** `OSS_PREFIX/` 下的对象，最新在前；每项都带 OSS 直链。 */
+  ossObjects: (limit = 50) => request<OssObjectList>(`/api/oss/objects?limit=${limit}`),
+
+  /** 按对象键换取新的 OSS 直链（预览 + 下载）。 */
+  ossPresign: (key: string) => {
+    const query = new URLSearchParams({ key })
+    return request<OssPresign>(`/api/oss/presign?${query.toString()}`)
+  },
+
+  ossDelete: (key: string) =>
+    request<void>(`/api/oss/images/${encodeOssKey(key)}`, { method: 'DELETE' }),
 }
 
 /** Markdown 里的相对图片路径（images/xxx.jpg）→ 解析结果静态目录。 */
@@ -412,10 +449,11 @@ async function streamGeneralChat(
   threadId: string,
   handlers: AgentChatStreamHandlers,
   signal?: AbortSignal,
+  images: string[] = [],
 ): Promise<void> {
   const events = await openEventStream(
     '/api/general-agent/chat/stream',
-    { message, thread_id: threadId },
+    { message, thread_id: threadId, images },
     signal,
   )
 

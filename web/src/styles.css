@@ -663,6 +663,57 @@ body {
   font-size: 14px;
 }
 
+.chat-user-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.chat-user-images .ant-image-img {
+  border-radius: 8px;
+}
+
+/* ---- 通用 Agent：待发送图片列表 --------------------------------------- */
+.chat-image-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px 14px 0;
+  background: var(--panel-bg);
+}
+
+.chat-image-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 250px;
+  padding: 4px 4px 4px 5px;
+  border: 1px solid var(--panel-border);
+  border-radius: 10px;
+  background: var(--page-bg);
+}
+
+.chat-image-chip img {
+  width: 34px;
+  height: 34px;
+  object-fit: cover;
+  border-radius: 7px;
+  flex: none;
+}
+
+.chat-image-name {
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.chat-image-chip .ant-btn {
+  flex: none;
+}
+
 .chat-bubble .markdown-body {
   font-size: 14px;
 }
@@ -1074,3 +1125,70 @@ body {
   margin-bottom: 4px;
   font-size: 11px;
 }
+
+/* ---- 私域 OSS ----------------------------------------------------------- */
+.oss-upload-result {
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px dashed var(--panel-border);
+}
+
+.oss-result-image {
+  flex: none;
+  border: 1px solid var(--panel-border);
+  background: var(--page-bg);
+}
+
+.oss-result-meta {
+  flex: 1;
+  min-width: 0;
+}
+
+.oss-result-meta .ant-descriptions-item-label {
+  width: 72px;
+  white-space: nowrap;
+}
+
+.oss-preview {
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px dashed var(--panel-border);
+  min-width: 0;
+}
+
+.oss-preview-empty {
+  justify-content: center;
+  border-top-style: dashed;
+}
+
+.oss-preview-image {
+  flex: none;
+  max-width: 220px;
+  max-height: 220px;
+  border-radius: 10px;
+  border: 1px solid var(--panel-border);
+  background: var(--page-bg);
+  object-fit: contain;
+}
+
+.oss-preview-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+}
+
+@media (max-width: 720px) {
+  .oss-upload-result,
+  .oss-preview {
+    flex-direction: column;
+  }
+}
+

@@ -7,6 +7,7 @@ Every knob of the pipeline lives here so the rest of the code never reads
 from __future__ import annotations
 
 import os
+import re
 from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -46,6 +47,9 @@ class Settings(BaseSettings):
     # ---- chat model: any OpenAI compatible endpoint --------------------
     # OpenAI / DeepSeek / Qwen / Moonshot / Ollama / vLLM all work here.
     llm_model: str = "gpt-4o-mini"
+    # 通用 Agent 专用模型：要接收用户上传图片时必须支持视觉（如 qwen3-vl-plus）；
+    # 留空跟随 LLM_MODEL。其他链路（RAG 问答等）仍使用 LLM_MODEL。
+    general_agent_model: str | None = None
     llm_api_key: SecretStr | None = None
     llm_base_url: str | None = None
     llm_temperature: float = 0.0
@@ -196,6 +200,27 @@ class Settings(BaseSettings):
     mineru_max_file_mb: int = 200
     mineru_output_dir: Path = PROJECT_ROOT / "data" / "parsed"
 
+    # ---- 阿里云 OSS（私域图片：管理接口走 access，图片读取走 OSS 直链）----
+    # Bucket 是私有的：应用用 AccessKey 在服务端做 V1 签名，前端永远拿不到
+    # AccessKey Secret。上传 / 列表 / 删除 / 换取直链要带 access 口令
+    # （`X-OSS-Access` 请求头或 `?access=`）；图片统一用 OSS 预签名直链读取。
+    oss_bucket: str | None = None
+    # 区域 Endpoint，如 https://oss-cn-shenzhen.aliyuncs.com（不带 Bucket）。
+    oss_endpoint: str | None = None
+    oss_region: str = "cn-shenzhen"
+    oss_access_key_id: SecretStr | None = None
+    oss_access_key_secret: SecretStr | None = None
+    # 对象键前缀（对应控制台里的目录），上传写 `<prefix>/<年>/<月>/<日>/<uuid>.<后缀>`。
+    oss_prefix: str = "image3"
+    # 访问口令：上传 / 列表 / 删除 / 换取直链必须携带；留空时管理接口返回 503。
+    oss_access_token: SecretStr | None = None
+    # OSS 直链（预览 / 附件下载）的有效期（秒）。
+    oss_url_expires: int = 86400
+    # 单张图片大小上限与允许的后缀（逗号分隔）。
+    oss_max_file_mb: int = 10
+    oss_allowed_suffixes: str = ".jpg,.jpeg,.png,.gif,.webp,.bmp"
+    oss_timeout: float = 60.0
+
     # ---- MySQL（本地已有库；只做连接与健康检查）------------------------
     # 既接受 Java 项目的 JDBC 形式（jdbc:mysql://...），也接受 SQLAlchemy 的
     # mysql+pymysql://... 形式；连接参数由 `db.dsn` 统一翻译。
@@ -233,6 +258,60 @@ class Settings(BaseSettings):
         """可展示的连接串（密码显示为 `***`）。"""
         target = self.mysql_target
         return target.safe_dsn if target else None
+
+    # ---- OSS 派生属性 ----------------------------------------------------
+    @property
+    def resolved_oss_access_key_id(self) -> str | None:
+        return self.oss_access_key_id.get_secret_value() if self.oss_access_key_id else None
+
+    @property
+    def resolved_oss_access_key_secret(self) -> str | None:
+        if self.oss_access_key_secret is None:
+            return None
+        return self.oss_access_key_secret.get_secret_value()
+
+    @property
+    def resolved_oss_access_token(self) -> str | None:
+        return self.oss_access_token.get_secret_value() if self.oss_access_token else None
+
+    @property
+    def oss_configured(self) -> bool:
+        """Bucket / Endpoint / AccessKey 都齐了才算可读写 OSS。"""
+        return bool(
+            self.oss_bucket
+            and self.oss_endpoint
+            and self.resolved_oss_access_key_id
+            and self.resolved_oss_access_key_secret
+        )
+
+    @property
+    def oss_access_configured(self) -> bool:
+        return bool(self.resolved_oss_access_token)
+
+    @property
+    def oss_endpoint_url(self) -> str | None:
+        return self.oss_endpoint.rstrip("/") if self.oss_endpoint else None
+
+    @property
+    def oss_host(self) -> str | None:
+        """虚拟主机风格访问域名：``<bucket>.<endpoint-host>``。"""
+        if not self.oss_endpoint:
+            return None
+        host = urlsplit(self.oss_endpoint).hostname
+        if not host:
+            return None
+        if not self.oss_bucket or host.startswith(f"{self.oss_bucket}."):
+            return host
+        return f"{self.oss_bucket}.{host}"
+
+    @property
+    def oss_base_url(self) -> str | None:
+        host = self.oss_host
+        return f"https://{host}" if host else None
+
+    @property
+    def oss_suffixes(self) -> tuple[str, ...]:
+        return tuple(item.strip() for item in self.oss_allowed_suffixes.split(",") if item.strip())
 
     @property
     def resolved_llm_api_key(self) -> str | None:
@@ -347,6 +426,7 @@ class Settings(BaseSettings):
         return {
             "env": self.app_env,
             "llm": f"{self.llm_model} @ {self.llm_base_url or 'api.openai.com'}",
+            "general_agent_model": self.general_agent_model or self.llm_model,
             "llm_api_key": _mask(self.resolved_llm_api_key),
             "embeddings": f"{self.embedding_model} @ {self.embedding_base_url or 'api.openai.com'}",
             "embedding_api_key": _mask(self.resolved_embedding_api_key),
@@ -400,6 +480,12 @@ class Settings(BaseSettings):
             "mysql": mysql,
             # 数据库口令不做“后四位”提示：短口令会被直接猜出来。
             "mysql_password": "set" if self.mysql_password else "missing",
+            "oss": (
+                f"{self.oss_bucket or '未配置'} @ {self.oss_host or '未配置'} / "
+                f"{self.oss_prefix} ({'on' if self.oss_configured else 'off'})"
+            ),
+            "oss_access_key_id": _mask(self.resolved_oss_access_key_id),
+            "oss_access_token": "set" if self.oss_access_configured else "missing",
         }
 
     # ---- normalisation -------------------------------------------------
@@ -407,6 +493,7 @@ class Settings(BaseSettings):
         "llm_base_url",
         "embedding_base_url",
         "llm_api_key",
+        "general_agent_model",
         "embedding_api_key",
         "dashscope_api_key",
         "mineru_api_key",
@@ -422,6 +509,11 @@ class Settings(BaseSettings):
         "web_extractor_base_url",
         "web_extractor_api_key",
         "web_extractor_model",
+        "oss_bucket",
+        "oss_endpoint",
+        "oss_access_key_id",
+        "oss_access_key_secret",
+        "oss_access_token",
         mode="before",
     )
     @classmethod
@@ -458,6 +550,81 @@ class Settings(BaseSettings):
     @classmethod
     def _strip_embedding_base_url(cls, value: str | None) -> str | None:
         return value.rstrip("/") if value else None
+
+    @field_validator("oss_endpoint", mode="after")
+    @classmethod
+    def _normalize_oss_endpoint(cls, value: str | None) -> str | None:
+        """接受 ``oss-cn-shenzhen.aliyuncs.com`` 或带协议 / Bucket 的写法，统一成区域 Endpoint。"""
+        if not value:
+            return None
+        raw = value.strip()
+        if "://" not in raw:
+            raw = f"https://{raw}"
+        host = urlsplit(raw).hostname
+        if not host:
+            raise ValueError("OSS_ENDPOINT 不是合法的域名或 URL")
+        return f"https://{host}"
+
+    @field_validator("oss_bucket", mode="after")
+    @classmethod
+    def _normalize_oss_bucket(cls, value: str | None) -> str | None:
+        if not value:
+            return None
+        bucket = value.strip().lower()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]", bucket):
+            raise ValueError("OSS_BUCKET 只能包含小写字母、数字与中划线，长度 3~63")
+        return bucket
+
+    @field_validator("oss_prefix", mode="after")
+    @classmethod
+    def _normalize_oss_prefix(cls, value: str) -> str:
+        prefix = (value or "").strip().strip("/")
+        parts = [part for part in prefix.split("/") if part]
+        if not parts:
+            raise ValueError("OSS_PREFIX 不能为空（私域 OSS 只允许访问该目录下的对象）")
+        if any(part in {".", ".."} for part in parts):
+            raise ValueError("OSS_PREFIX 不能包含 . / .. 路径片段")
+        return "/".join(parts)
+
+    @field_validator("oss_allowed_suffixes", mode="after")
+    @classmethod
+    def _normalize_oss_suffixes(cls, value: str) -> str:
+        suffixes: list[str] = []
+        for raw in (value or "").split(","):
+            suffix = raw.strip().lower()
+            if not suffix:
+                continue
+            if not suffix.startswith("."):
+                suffix = f".{suffix}"
+            if not re.fullmatch(r"\.[a-z0-9]{1,10}", suffix):
+                raise ValueError(f"OSS_ALLOWED_SUFFIXES 里的后缀不合法: {raw}")
+            if suffix not in suffixes:
+                suffixes.append(suffix)
+        if not suffixes:
+            raise ValueError("OSS_ALLOWED_SUFFIXES 至少要配置一个图片后缀")
+        return ",".join(suffixes)
+
+    @field_validator("oss_url_expires", mode="after")
+    @classmethod
+    def _positive_oss_url_expires(cls, value: int) -> int:
+        # 60 秒 ~ 30 天：太短复制出去就失效，太长等于永久公开。
+        if not 60 <= value <= 30 * 24 * 3600:
+            raise ValueError("OSS_URL_EXPIRES 必须在 60 ~ 2592000 秒之间")
+        return value
+
+    @field_validator("oss_max_file_mb", mode="after")
+    @classmethod
+    def _positive_oss_max_file(cls, value: int) -> int:
+        if not 1 <= value <= 100:
+            raise ValueError("OSS_MAX_FILE_MB 必须在 1 ~ 100 之间")
+        return value
+
+    @field_validator("oss_timeout", mode="after")
+    @classmethod
+    def _positive_oss_timeout(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("OSS_TIMEOUT 必须是正数")
+        return value
 
     @field_validator("web_search_base_url", mode="after")
     @classmethod

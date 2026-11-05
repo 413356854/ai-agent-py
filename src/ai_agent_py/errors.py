@@ -56,3 +56,28 @@ class RerankError(AiAgentError):
 
 class SplitCacheMiss(AiAgentError):
     """切分结果缓存不存在或已过期（服务重启 / 换实例 / 超过 TTL）。"""
+
+
+class OssError(AiAgentError):
+    """阿里云 OSS 调用失败（网络、鉴权、服务端错误）。"""
+
+
+class OssNotConfigured(OssError):
+    """OSS 或访问口令未配置（缺 Bucket / Endpoint / AccessKey / OSS_ACCESS_TOKEN）。"""
+
+
+class OssAccessDenied(OssError):
+    """OSS 侧拒绝访问：AccessKey 无权限、Bucket 策略不允许等。"""
+
+
+class OssObjectNotFound(OssError):
+    """OSS 对象不存在。"""
+
+
+class OssInvalidKey(OssError):
+    """对象键不合法，或不在 OSS_PREFIX 目录内。"""
+
+
+class OssUploadRejected(OssError):
+    """上传内容不符合要求（后缀、大小、文件头校验）。"""
+

@@ -11,7 +11,7 @@ from typing import Any
 
 from fastapi.testclient import TestClient
 from langchain_core.documents import Document
-from langchain_core.messages import AIMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 import ai_agent_py.api.general_agent as api_general
 from ai_agent_py.api.app import app as fastapi_app
@@ -286,6 +286,92 @@ def test_chat_persists_messages_and_reuses_history(monkeypatch, tmp_path: Path) 
     assert "第一轮回答" in contents
     assert "第二个问题" in contents
     assert [message.seq for message in store.load_messages("t-1")] == [1, 2, 3, 4]
+
+
+def test_chat_attaches_uploaded_image_urls(monkeypatch, tmp_path: Path) -> None:
+    oss_url = (
+        "https://agent3.oss-cn-shenzhen.aliyuncs.com/image3/2026/11/05/abc.png"
+        "?OSSAccessKeyId=AK&Expires=1793944492&Signature=abc"
+    )
+    settings = make_settings(
+        tmp_path,
+        oss_bucket="agent3",
+        oss_endpoint="https://oss-cn-shenzhen.aliyuncs.com",
+        oss_access_key_id="AK",
+        oss_access_key_secret="SK",
+        oss_prefix="image3",
+        oss_access_token="token",
+    )
+    model = ScriptedChatModel(responses=[AIMessage(content="收到图片")])
+    client, store, _ = make_client(monkeypatch, tmp_path, model=model, settings=settings)
+
+    response = client.post(
+        "/api/general-agent/chat",
+        json={"message": "看看这张图", "thread_id": "t-img", "images": [oss_url]},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["answer"] == "收到图片"
+    user = store.load_messages("t-img")[0]
+    assert user.role == "user"
+    assert user.content.startswith("看看这张图")
+    assert f"![用户上传的图片]({oss_url})" in user.content
+    human = next(
+        message for message in model.received[-1] if isinstance(message, HumanMessage)
+    )
+    assert isinstance(human.content, list)
+    assert {"type": "image", "url": oss_url} in human.content
+    assert any(
+        block.get("type") == "text" and "看看这张图" in block.get("text", "")
+        for block in human.content
+    )
+
+    # 第二轮没有新图片，但历史里的用户消息仍要还原成 image 内容块。
+    model.responses.append(AIMessage(content="第二轮回答"))
+    second = client.post(
+        "/api/general-agent/chat",
+        json={"message": "继续", "thread_id": "t-img"},
+    )
+    assert second.status_code == 200
+    history_human = [
+        message for message in model.received[-1] if isinstance(message, HumanMessage)
+    ]
+    assert any(
+        isinstance(message.content, list)
+        and {"type": "image", "url": oss_url} in message.content
+        for message in history_human
+    )
+
+
+def test_chat_rejects_image_urls_outside_bucket(monkeypatch, tmp_path: Path) -> None:
+    settings = make_settings(
+        tmp_path,
+        oss_bucket="agent3",
+        oss_endpoint="https://oss-cn-shenzhen.aliyuncs.com",
+        oss_access_key_id="AK",
+        oss_access_key_secret="SK",
+        oss_prefix="image3",
+        oss_access_token="token",
+    )
+    client, _, _ = make_client(monkeypatch, tmp_path, settings=settings)
+
+    wrong_host = client.post(
+        "/api/general-agent/chat",
+        json={
+            "message": "看图",
+            "images": ["https://evil.example.com/image3/2026/11/05/abc.png"],
+        },
+    )
+    assert wrong_host.status_code == 400
+
+    wrong_prefix = client.post(
+        "/api/general-agent/chat",
+        json={
+            "message": "看图",
+            "images": ["https://agent3.oss-cn-shenzhen.aliyuncs.com/other/abc.png"],
+        },
+    )
+    assert wrong_prefix.status_code == 400
 
 
 def test_chat_records_tool_calls(monkeypatch, tmp_path: Path) -> None:

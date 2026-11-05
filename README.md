@@ -51,6 +51,10 @@
 - **管理后台**：React 19 + TypeScript + Ant Design，栏目「RAG 管理 → 文档解析 / RAG 记录 / RAG 问答」，
   支持多文件、多批次加入待解析队列，点击后按顺序逐个提交，任务进度、Markdown 预览、下载、
   切分预览、入库 RAG 一站式完成；右上角一键切换 **亮色 / 暗色主题**。
+- **私域 OSS**：对接阿里云 OSS **私有 Bucket**（`agent3` / 目录 `image3`），后台新增「私域 OSS」栏目：
+  上传图片即时返回 **OSS 直链**（预览 + 附件下载），粘贴直链即可预览、下载，支持删除；页面无需
+  输入口令，后端从 `.env` 读取 `OSS_ACCESS_TOKEN` 并签发 HttpOnly 会话 Cookie，脚本仍可用
+  `X-OSS-Access` 访问。图片统一走 OSS 直链，直链含 `OSSAccessKeyId` + 限时签名，Secret 只留在服务端。
 - **RAG 记录**：直接分页浏览 Milvus `rag_chunk`，可按文档 / 正文关键词（中缀）过滤，展示总块数、
   文档分布与向量维度；文档名按 `doc_id` 从 MySQL 任务表回查，一键跳到「文档解析」看原文。
   列表先按 `(doc_id, chunk_index)` 全局排序再回查正文，翻页时块序号连续、可读；内容只展示前两行，
@@ -75,6 +79,12 @@
   （`tb_agent_chat_session` / `tb_agent_chat_message` / `tb_agent_chat_summary`），
   刷新页面、重启服务后仍可回放并继续追问。**上下文压缩**分三层：工具输出头尾修剪、
   历史 token 预算、MySQL 滚动摘要（8 节结构化检查点），并支持溢出重试与手动压缩。
+  **聊天窗支持多选图片**：选中后先本地预览、可逐张移除，点「发送」时才上传到私域 OSS；
+  抓到的 OSS 直链以 Markdown 图片链接随用户消息写入 MySQL，气泡里显示缩略图。
+  发给模型时按 LangChain 标准内容块 `{"type": "image", "url": ...}` 组装（`ChatOpenAI`
+  会自动转换为 provider 原生的 `image_url`），**通用 Agent 使用 `GENERAL_AGENT_MODEL`**
+  （留空跟随 `LLM_MODEL`），接收图片时需要支持视觉的模型（如 `qwen3-vl-plus`）；
+  历史回放时同样会把图片链接还原成 image 块。
 - **中文友好**：分块规则针对中文标点调优，提示词与 CLI / 前端输出均为中文。
 
 ## 目录结构
@@ -96,6 +106,10 @@ ai-agent-py/
 │   ├── llm.py                # 对话模型 / 向量模型工厂（OpenAI 兼容协议）
 │   ├── offline.py            # 离线用的占位模型、哈希向量与内存检索器（demo & 测试）
 │   ├── cli.py                # 命令行：info/db/ingest/ask/chat/demo/parse/serve
+│   ├── alioss/               # 阿里云 OSS（私有图片：V1 签名 / OSS 直链 / access 会话）
+│   │   ├── client.py         # OSS V1 签名 + httpx：PUT / GET / LIST / DELETE / 预签名 URL
+│   │   ├── service.py        # 图片校验、对象键规划、OSS 直链签名、列表与删除
+│   │   └── models.py         # 上传 / 列表 / 直链 / 概览的接口模型
 │   ├── db/
 │   │   ├── dsn.py            # JDBC mysql:// → mysql+pymysql://（字符集 / 时区 / 超时）
 │   │   ├── health.py         # 连接池 + 只读健康检查（版本 / 库 / 表数 / 连接池）
@@ -147,8 +161,9 @@ ai-agent-py/
 │       ├── documents.py      # 文档解析接口：上传 / 状态 / 预览 / 下载 / 切分 / 入库
 │       ├── agents.py         # Agent 应用：列表 / 图导出 / 样例 / 试跑
 │       ├── general_agent.py  # 通用 Agent：概览 / MySQL 会话 / 对话（含 SSE 流式）
+│       ├── oss.py            # 私域 OSS：上传 / 列举 / 换取直链 / 删除（access 鉴权）
 │       └── rag.py            # RAG 记录列表 + RAG 问答（含 SSE 流式）
-├── web/                      # 管理后台（文档解析 / RAG 记录 / RAG 问答 / Agent 应用 / 通用 Agent）
+├── web/                      # 管理后台（文档解析 / RAG 记录 / RAG 问答 / Agent 应用 / 通用 Agent / 私域 OSS）
 └── tests/                    # pytest：加载、切分、链路、图、API、CLI、MinerU、MySQL、RAG、通用 Agent
 ```
 
@@ -227,8 +242,8 @@ Invoke-RestMethod -Uri http://127.0.0.1:8000/query -Method Post `
 | GET | `/api/general-agent/sessions/{id}/messages` | 会话消息回放（user / assistant / 工具调用记录，含 `compressed` 标记与摘要） |
 | POST | `/api/general-agent/sessions/{id}/compact` | 手动压缩更早历史（`{"keep": 8}` 可选），返回压缩条数与摘要 |
 | DELETE | `/api/general-agent/sessions/{id}` | 删除会话及其全部消息 |
-| POST | `/api/general-agent/chat` | 通用 Agent 对话（同步）：`answer` + 本轮新增的助手 / 工具消息 |
-| POST | `/api/general-agent/chat/stream` | 同上，SSE 流式：`session` →（`tool_call` → `tool_result`）… → `token`… → `done` |
+| POST | `/api/general-agent/chat` | 通用 Agent 对话（同步）：`answer` + 本轮新增的助手 / 工具消息；可选 `images`（OSS 直链，最多 9 张，后端转成标准 image 内容块） |
+| POST | `/api/general-agent/chat/stream` | 同上，SSE 流式：`session` →（`tool_call` → `tool_result`）… → `token`… → `done`；`images` 处理方式相同 |
 | GET | `/health` | 版本、模型、向量库、chunk 数与 MySQL 连接状态 |
 | GET | `/info` | 配置快照（密钥脱敏） |
 | GET | `/api/db/health` | MySQL 连接检查：服务端版本、库名、表数、时区、耗时、连接池 |
@@ -242,6 +257,11 @@ Invoke-RestMethod -Uri http://127.0.0.1:8000/query -Method Post `
 | POST | `/api/documents/{id}/rag` | **按 `split_id` 从缓存取切片写入 Milvus** `db_tax_rag.rag_chunk`（可重复入库：先删旧切片；成功后任务记录 `rag_ingested=true`） |
 | DELETE | `/api/documents/{id}` | 删除任务、结果与源文件 |
 | GET | `/parsed/{id}/images/...` | 解析结果里的图片（Markdown 预览用） |
+| GET | `/api/oss/overview` | **私域 OSS** 配置：Bucket / 目录 / 访问要求 / 大小上限（不含密钥）；同时签发页面会话 Cookie |
+| POST | `/api/oss/images` | **上传图片**（multipart；页面会话或 `X-OSS-Access`）→ `key` + OSS 直链 `url` / `download_url` / `expires_in` |
+| GET | `/api/oss/presign?key=...` | 按对象键换取新的 OSS 直链（预览 + 附件下载） |
+| GET | `/api/oss/objects` | 列举 `OSS_PREFIX/` 下的图片（最新在前；每项带 OSS 直链） |
+| DELETE | `/api/oss/images/{key}` | 删除图片（会话或 `X-OSS-Access`） |
 | GET | `/api/rag/overview` | **RAG 记录 / 问答**概览：Milvus 连接、总块数、文档分布、模型配置状态（含精排 `rerank_model` / `rerank_configured`） |
 | GET | `/api/rag/chunks` | **`rag_chunk` 记录列表**：`doc_id` / `keyword` / `page` / `page_size` |
 | POST | `/api/rag/chat` | **RAG 问答**（LangGraph，`thread_id` 保留多轮上下文）→ `answer` + `sources` |
@@ -381,6 +401,121 @@ curl.exe -N -X POST http://127.0.0.1:8000/api/rag/chat/stream `
   -d '{"message":"业务招待费的扣除标准是什么？","thread_id":"demo-1"}'
 ```
 
+## Agent 应用（报销审核 / 通用 Agent）
+
+后台「Agent 应用」栏目汇总每个 Agent 的节点 / 规则 / 版本，点进去可直接看 LangGraph 工序图，
+也提供样例试跑与通用 Agent 对话：
+
+![报销审核 Agent 流程图](docs/screenshots/agent-reimburse.png)
+
+![通用 Agent 工具调用](docs/screenshots/agent-general.png)
+
+- **报销审核**：9 节点工序图 + 13 条规则，可下载 / 上传 xlsx 单据试跑，结果给出「通过 / 退回 / 转人工」与依据；
+- **通用 Agent**：ReAct 图一次接入知识库、文件、命令、联网工具，工具调用与回答通过 SSE 实时展示，会话记忆保存在 MySQL。
+
+## 私域 OSS（阿里云 OSS 私有 Bucket）
+
+后台「私域 OSS」栏目对接 `agent3`（华南 1 深圳）的私有 Bucket，目录 `image3/`：
+
+```text
+浏览器 ──会话 Cookie（打开页面自动签发）──▶ FastAPI /api/oss/*（上传 / 列举 / 删除 / 换直链）
+                                      │ OSS V1 签名（AccessKey 只在服务端）
+                                      ▼
+                              私有 Bucket agent3 / image3/<年>/<月>/<日>/<uuid>.png
+                                      │
+   <img src="https://agent3...?OSSAccessKeyId=...&Expires=...&Signature=...">  ◀┘
+                                      ↑
+                              图片读取统一走 OSS 直链（不再经过本服务）
+```
+
+### 访问模型
+
+页面打开时 `GET /api/oss/overview` 会用 `.env` 里的 `OSS_ACCESS_TOKEN` 派生一个
+**HttpOnly + SameSite=Strict** 的 `oss_session` Cookie（`Path=/api/oss`）。前端不需要、
+也拿不到口令本身；上传 / 列举 / 删除 / 换取直链自动带上会话。脚本仍可使用请求头：
+
+| 操作 | 鉴权 |
+| --- | --- |
+| 上传 `POST /api/oss/images` | 页面会话 Cookie；脚本用 `X-OSS-Access: <OSS_ACCESS_TOKEN>`（或 `?access=`） |
+| 列举 `GET /api/oss/objects` | 同上 |
+| 换取直链 `GET /api/oss/presign?key=...` | 同上 |
+| 删除 `DELETE /api/oss/images/{key}` | 同上 |
+| 读取图片 | **OSS 直链**（预签名 GET，不需要本服务） |
+
+- 上传与列表接口直接返回两个 OSS 直链：
+  - `url`：预览直链，可直接放 `<img>`、浏览器打开或复制；
+  - `download_url`：签名里带 `response-content-disposition=attachment`，点击即下载。
+- 直链里只有 `OSSAccessKeyId` + `Expires` + `Signature`，**没有 AccessKey Secret**；但链接本身是
+  限时访问凭证，任何拿到链接的人都能在有效期内读取这一张图（默认 24 小时，`OSS_URL_EXPIRES`）。
+  改 `OSS_ACCESS_TOKEN` **不会**吊销已发出的 OSS 直链，只能等过期或轮换 RAM AccessKey。
+- 会话值 = `HMAC-SHA256(OSS_ACCESS_TOKEN, "ai-agent-py:oss-session:v1")`，口令本身不会出现在
+  Cookie、JS 或 URL 里；改掉 `OSS_ACCESS_TOKEN` 后旧会话立即失效。
+- `OSS_ACCESS_KEY_ID/SECRET` 只参与服务端 OSS V1 签名（`PUT/GET/LIST/DELETE` 与预签名），
+  前端拿不到 Secret；Bucket 保持私有，不设置公共读。
+- 所有管理接口只允许 `OSS_PREFIX/` 下的对象：`other/x.png`、`image3/../x` 一律 400；
+  直链也只会为这些 key 签发。
+- 上传会校验后缀、大小与文件头（PNG / JPEG / GIF / WEBP / BMP），避免把任意文件改名后塞进桶里；
+  SVG 默认不允许（避免内联脚本）。
+- **注意**：去掉页面口令输入后，能打开后台页面的人都能使用私域 OSS（含获取直链）；如果后台要
+  暴露到公网，请在反向代理层加登录 / IP 白名单，或恢复显式 access 校验。
+
+### 命令行示例
+
+```powershell
+$env:OSS_ACCESS = "oss_xxx"   # 与 .env 的 OSS_ACCESS_TOKEN 一致
+
+# 上传：返回 key + 两个 OSS 直链（预览 / 下载）
+$img = curl.exe -s -X POST http://127.0.0.1:8000/api/oss/images `
+  -H "X-OSS-Access: $env:OSS_ACCESS" -F "file=@cat.png" | ConvertFrom-Json
+$img | Select-Object key, size, url, download_url, expires_in
+
+# 直接用 OSS 直链读取（不需要 access；浏览器 / <img> 都能用）
+Invoke-WebRequest $img.url -OutFile cat-read.png
+
+# 直链过期后按 key 重新换取
+Invoke-RestMethod "http://127.0.0.1:8000/api/oss/presign?key=$($img.key)" `
+  -Headers @{ "X-OSS-Access" = $env:OSS_ACCESS }
+
+# 列举 / 删除
+Invoke-RestMethod "http://127.0.0.1:8000/api/oss/objects?limit=20" `
+  -Headers @{ "X-OSS-Access" = $env:OSS_ACCESS }
+Invoke-WebRequest "http://127.0.0.1:8000/api/oss/images/$($img.key)" -Method Delete `
+  -Headers @{ "X-OSS-Access" = $env:OSS_ACCESS }
+```
+
+上传返回示例：
+
+```json
+{
+  "key": "image3/2026/11/05/5caa913b588e408782212af392a1abfb.png",
+  "name": "cat.png",
+  "size": 70,
+  "content_type": "image/png",
+  "url": "https://agent3.oss-cn-shenzhen.aliyuncs.com/image3/...?OSSAccessKeyId=...&Expires=...&Signature=...",
+  "download_url": "https://agent3.oss-cn-shenzhen.aliyuncs.com/image3/...?OSSAccessKeyId=...&Expires=...&Signature=...&response-content-disposition=attachment%3B%20filename%3D%22...%22",
+  "expires_in": 86400
+}
+```
+
+### 前端页面
+
+![私域 OSS](docs/screenshots/oss-page.png)
+
+「私域 OSS」页分三块：
+
+1. **上传图片**：拖拽 / 选择图片 → 立即上传，展示预览、对象键、OSS 直链（一键复制）、
+   `预览`、`下载` 和 `删除`；
+2. **访问 OSS 直链**：粘贴 OSS 直链（或裸对象键）→ 点「访问」，服务端按 key 重新签发
+   预览 / 下载直链，图片预览并支持下载；
+3. **最近上传**：列出私有目录里的图片，可预览 / 复制直链 / 下载 / 删除。
+
+页面不再要求输入访问口令：`GET /api/oss/overview` 已经从 `.env` 读取 `OSS_ACCESS_TOKEN` 并签发
+会话 Cookie；口令不会出现在前端代码、localStorage 或 URL 里。
+
+> AccessKey Secret 只存在 `.env`；但 OSS 直链里会出现 `OSSAccessKeyId`。`OSS_ACCESS_TOKEN`
+> 泄露或需要让旧会话 / 旧 access 失效时，改掉它并重启服务即可（已发出的 OSS 直链仍会在
+> `OSS_URL_EXPIRES` 内有效，只能等过期或轮换 RAM AccessKey）。
+
 ## Milvus 通用业务 RAG 表（唯一向量库）
 
 Milvus `rag_chunk` 是**唯一**的向量库：`/query`、智能体的 `search_knowledge_base` 工具、
@@ -505,9 +640,7 @@ Invoke-RestMethod http://127.0.0.1:8000/api/db/health
 对接官方 [精准解析 API](https://mineru.net/apiManage/docs)：支持 `pipeline` / `vlm`（默认，精度最高）/
 `MinerU-HTML`，单文件 ≤ 200 MB、≤ 600 页，支持 PDF、图片、Doc/Docx、Ppt/PPTx。
 
-![文档解析列表（亮色）](docs/screenshots/documents-list.png)
-
-![文档解析列表（暗色）](docs/screenshots/documents-dark.png)
+![文档解析（亮色）](docs/screenshots/documents-list.png)
 
 ![Markdown 预览（暗色）](docs/screenshots/documents-dark-preview.png)
 
@@ -578,6 +711,7 @@ Invoke-RestMethod "http://127.0.0.1:8000/api/documents/$($job.id)"
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `LLM_MODEL` / `LLM_API_KEY` / `LLM_BASE_URL` | `gpt-4o-mini` / 空 / 空 | 对话模型（任何 OpenAI 兼容端点）；`LLM_API_KEY` 留空时回退环境变量 `DASHSCOPE_API_KEY`、再回退 `OPENAI_API_KEY` |
+| `GENERAL_AGENT_MODEL` | 空（跟随 `LLM_MODEL`） | 通用 Agent 专用模型；接收用户上传图片时必须支持视觉，如 `qwen3-vl-plus` |
 | `EMBEDDING_MODEL` / `EMBEDDING_API_KEY` / `EMBEDDING_BASE_URL` | `text-embedding-3-small` / 空 / 空 | 向量模型，**必须与建索引时一致** |
 | `DASHSCOPE_API_KEY` | 空 | 阿里云百炼 Key；`LLM_API_KEY` / `EMBEDDING_API_KEY` 未填时分别作为对话 / 向量密钥 |
 | `EMBEDDING_DIMENSIONS` | 空 | 请求的向量维度（v4 默认 1024；本项目的 Milvus 表是 1536，必须显式指定） |
@@ -608,6 +742,13 @@ Invoke-RestMethod "http://127.0.0.1:8000/api/documents/$($job.id)"
 | `MINERU_POLL_INTERVAL` / `MINERU_TIMEOUT` | `3` / `600` | 轮询间隔与单任务最长等待（秒） |
 | `MINERU_MAX_CONCURRENT` / `MINERU_MAX_FILE_MB` | `2` / `200` | 并发解析数与单文件大小上限 |
 | `MINERU_OUTPUT_DIR` | `data/parsed` | 解析产物目录（源文件 / Markdown / 图片 / zip；任务记录在 MySQL） |
+| `OSS_BUCKET` / `OSS_ENDPOINT` / `OSS_REGION` | 空 / 空 / `cn-shenzhen` | 私有 Bucket 名与区域 Endpoint（如 `https://oss-cn-shenzhen.aliyuncs.com`） |
+| `OSS_ACCESS_KEY_ID` / `OSS_ACCESS_KEY_SECRET` | 空 | RAM 用户 AccessKey；只在服务端签名 OSS 请求，不返回前端 |
+| `OSS_PREFIX` | `image3` | 只允许读写该目录（对象键 `image3/<年>/<月>/<日>/<uuid>.<后缀>`） |
+| `OSS_ACCESS_TOKEN` | 空 | access 口令；页面会话 Cookie 由它派生，留空时上传 / 读取接口返回 503 |
+| `OSS_URL_EXPIRES` | `86400` | OSS 直链有效期（秒，60 ~ 2592000；默认 24 小时） |
+| `OSS_MAX_FILE_MB` / `OSS_ALLOWED_SUFFIXES` | `10` / `.jpg,.jpeg,.png,.gif,.webp,.bmp` | 单张图片大小上限、允许的后缀（SVG 默认不支持） |
+| `OSS_TIMEOUT` | `60` | 单次 OSS 请求超时（秒） |
 | `MYSQL_URL` / `MYSQL_USERNAME` / `MYSQL_PASSWORD` | 空 / 空 / 空 | 本地已有库的连接串与账号；支持 `jdbc:mysql://` 写法 |
 | `MYSQL_POOL_SIZE` / `MYSQL_MAX_OVERFLOW` | `5` / `10` | 常驻连接数与峰值溢出数 |
 | `MYSQL_POOL_RECYCLE` | `1800` | 连接回收秒数（避免 MySQL 侧 `wait_timeout` 断开） |

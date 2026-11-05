@@ -19,6 +19,7 @@ from ai_agent_py.api.database import router as database_router
 from ai_agent_py.api.documents import asset_router
 from ai_agent_py.api.documents import router as documents_router
 from ai_agent_py.api.general_agent import router as general_agent_router
+from ai_agent_py.api.oss import router as oss_router
 from ai_agent_py.api.rag import router as rag_router
 from ai_agent_py.config import PROJECT_ROOT, Settings, get_settings
 from ai_agent_py.db.health import DatabaseHealth, check_database
@@ -43,7 +44,11 @@ class SPAStaticFiles(StaticFiles):
         try:
             return await super().get_response(path, scope)
         except StarletteHTTPException as exc:
-            if exc.status_code == 404 and not path.startswith("api/"):
+            # 未命中的前端路由回退到 index.html；API 路径必须保持 404，
+            # 否则 `/api/...` 的拼写错误会拿到一张 200 的 HTML。
+            # Windows 下 StaticFiles 传入的 path 用反斜杠，统一成正斜杠再判断。
+            normalized = path.replace("\\", "/").lstrip("/")
+            if exc.status_code == 404 and not normalized.startswith("api/"):
                 return await super().get_response("index.html", scope)
             raise
 
@@ -184,6 +189,16 @@ def create_app() -> FastAPI:
 
     # ---- MySQL 连接诊断 -------------------------------------------------
     app.include_router(database_router)
+
+    # ---- 私域 OSS（阿里云私有 Bucket：上传 / 读取 / 列表 / 删除）---------
+    app.include_router(oss_router)
+
+    @app.on_event("shutdown")
+    async def _close_oss() -> None:
+        """关停时释放 OSS 的 httpx 连接池（首次请求才创建，可能不存在）。"""
+        service = getattr(app.state, "oss", None)
+        if service is not None:
+            await service.aclose()
 
     # ---- 静态资源：管理后台前端 ------------------------------------------
     if (WEB_DIST / "index.html").is_file():

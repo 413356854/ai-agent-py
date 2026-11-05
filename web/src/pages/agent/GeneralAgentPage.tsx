@@ -2,9 +2,11 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { KeyboardEvent } from 'react'
 import {
   BulbOutlined,
+  CloseOutlined,
   CompressOutlined,
   DatabaseOutlined,
   DeleteOutlined,
+  PictureOutlined,
   ReloadOutlined,
   RobotOutlined,
   SendOutlined,
@@ -20,6 +22,7 @@ import {
   Collapse,
   Drawer,
   Empty,
+  Image,
   Input,
   Popconfirm,
   Space,
@@ -27,7 +30,9 @@ import {
   Tag,
   Tooltip,
   Typography,
+  Upload,
 } from 'antd'
+import type { UploadProps } from 'antd'
 import dayjs from 'dayjs'
 import { ApiError, api } from '../../api/client'
 import { MarkdownPreview } from '../../components/MarkdownPreview'
@@ -39,6 +44,7 @@ import type {
   AgentContextStats,
   GeneralAgentOverview,
   GeneralAgentTool,
+  OssOverview,
 } from '../../types'
 
 /** 欢迎页示例：分别演示文件工具、知识库检索、联网搜索。 */
@@ -49,6 +55,23 @@ const EXAMPLES = [
 ]
 
 const TOOL_GROUP_ORDER = ['knowledge', 'filesystem', 'shell', 'web', 'other']
+
+/** 单条消息最多携带的图片数（与后端 ChatRequest.images 的限制一致）。 */
+const MAX_CHAT_IMAGES = 9
+
+/** 用户消息里由后端追加的 Markdown 图片链接 → 纯文本 + 图片 URL 列表。 */
+function splitImageMarkdown(content: string): { text: string; images: string[] } {
+  const images: string[] = []
+  const pattern = /!\[[^\]]*\]\((https?:\/\/[^)\s]+)\)/g
+  const text = content
+    .replace(pattern, (_match, url: string) => {
+      images.push(url)
+      return ''
+    })
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+  return { text, images }
+}
 
 type ToolStatus = 'running' | 'ok' | 'error'
 
@@ -68,7 +91,14 @@ interface UserItem {
   id: string
   seq?: number
   content: string
+  images?: string[]
   compressed?: boolean
+}
+
+interface SelectedImage {
+  id: string
+  file: File
+  preview: string
 }
 
 interface AssistantItem {
@@ -121,11 +151,13 @@ function toItems(messages: AgentChatMessage[], includeCompressed = false): ChatI
     .map((message, index) => {
       const key = message.seq || index + 1
       if (message.role === 'user') {
+        const { text, images } = splitImageMarkdown(message.content)
         return {
           kind: 'user',
           id: `user-${key}`,
           seq: message.seq,
-          content: message.content,
+          content: text,
+          images,
           compressed: message.compressed,
         }
       }
@@ -219,6 +251,21 @@ const MessageItem = memo(function MessageItem({ item }: { item: ChatItem }) {
           )}
           <div className="chat-bubble">
             <div className="chat-plain">{item.content}</div>
+            {item.images && item.images.length > 0 && (
+              <div className="chat-user-images">
+                <Image.PreviewGroup>
+                  {item.images.map((url) => (
+                    <Image
+                      key={url}
+                      src={url}
+                      width={116}
+                      height={116}
+                      style={{ objectFit: 'cover', borderRadius: 8 }}
+                    />
+                  ))}
+                </Image.PreviewGroup>
+              </div>
+            )}
           </div>
         </div>
       </div>
@@ -311,9 +358,24 @@ export function GeneralAgentPage() {
   const [lastContext, setLastContext] = useState<AgentContextStats | null>(null)
   const [showCompressed, setShowCompressed] = useState(false)
   const [compacting, setCompacting] = useState(false)
+  const [ossOverview, setOssOverview] = useState<OssOverview | null>(null)
+  const [selectedImages, setSelectedImages] = useState<SelectedImage[]>([])
+  const [uploadingImages, setUploadingImages] = useState(false)
 
   const abortRef = useRef<AbortController | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
+  const selectedImagesRef = useRef<SelectedImage[]>([])
+
+  useEffect(() => {
+    selectedImagesRef.current = selectedImages
+  }, [selectedImages])
+
+  useEffect(
+    () => () => {
+      for (const image of selectedImagesRef.current) URL.revokeObjectURL(image.preview)
+    },
+    [],
+  )
 
   const loadOverview = useCallback(async () => {
     setLoadingOverview(true)
@@ -343,6 +405,22 @@ export function GeneralAgentPage() {
     void loadOverview()
     void loadSessions()
   }, [loadOverview, loadSessions])
+
+  useEffect(() => {
+    // 同时完成两件事：读取上传限制，并由 /api/oss/overview 建立 OSS 页面会话 Cookie。
+    let cancelled = false
+    api
+      .ossOverview()
+      .then((next) => {
+        if (!cancelled) setOssOverview(next)
+      })
+      .catch(() => {
+        if (!cancelled) setOssOverview(null)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   useEffect(() => {
     const element = scrollRef.current
@@ -477,30 +555,91 @@ export function GeneralAgentPage() {
     [threadId, toast],
   )
 
+  const removeSelectedImage = (id: string) => {
+    setSelectedImages((previous) => {
+      const target = previous.find((image) => image.id === id)
+      if (target) URL.revokeObjectURL(target.preview)
+      return previous.filter((image) => image.id !== id)
+    })
+  }
+
+  const clearSelectedImages = () => {
+    for (const image of selectedImagesRef.current) URL.revokeObjectURL(image.preview)
+    setSelectedImages([])
+  }
+
+  const addImages: UploadProps['beforeUpload'] = (file) => {
+    if (!ossOverview?.configured || !ossOverview.access_configured) {
+      toast.warning('私域 OSS 未配置，暂时不能上传图片')
+      return Upload.LIST_IGNORE
+    }
+    const suffix = `.${(file.name.split('.').pop() ?? '').toLowerCase()}`
+    if (!ossOverview.accepted_suffixes.includes(suffix)) {
+      toast.error(`图片只支持 ${ossOverview.accepted_suffixes.join(' / ')}`)
+      return Upload.LIST_IGNORE
+    }
+    if (file.size > ossOverview.max_file_mb * 1024 * 1024) {
+      toast.error(`单张图片不能超过 ${ossOverview.max_file_mb} MB`)
+      return Upload.LIST_IGNORE
+    }
+    setSelectedImages((previous) => {
+      if (previous.length >= MAX_CHAT_IMAGES) {
+        toast.warning(`一次最多添加 ${MAX_CHAT_IMAGES} 张图片`)
+        return previous
+      }
+      return [...previous, { id: newId(), file, preview: URL.createObjectURL(file) }]
+    })
+    return Upload.LIST_IGNORE
+  }
+
   const newSession = () => {
     abortRef.current?.abort()
     setThreadId(newId())
     setItems([])
     setInput('')
+    clearSelectedImages()
     setSummaryInfo(null)
     setLastContext(null)
     setShowCompressed(false)
   }
 
   const send = useCallback(
-    async (text: string) => {
-      const content = text.trim()
-      if (!content || streaming || !canChat) return
+    async (text: string, files: File[] = []) => {
+      const typed = text.trim()
+      if ((!typed && files.length === 0) || streaming || uploadingImages || !canChat) return
+      const content = typed || '请查看我上传的图片'
+
+      // 只有点击发送（或 Enter）才会上传；上传完成后再把 URL 交给聊天接口。
+      const imageUrls: string[] = []
+      if (files.length > 0) {
+        if (!ossOverview?.configured || !ossOverview.access_configured) {
+          toast.warning('私域 OSS 未配置，暂时不能上传图片')
+          return
+        }
+        setUploadingImages(true)
+        try {
+          for (const file of files) {
+            const uploaded = await api.ossUpload(file)
+            imageUrls.push(uploaded.url)
+          }
+        } catch (error) {
+          toast.error(`图片上传失败：${errorText(error)}`)
+          return
+        } finally {
+          setUploadingImages(false)
+        }
+      }
 
       const currentThread = threadId || newId()
       if (!threadId) setThreadId(currentThread)
       const assistantId = newId()
       setItems((previous) => [
         ...previous,
-        { kind: 'user', id: newId(), content },
+        { kind: 'user', id: newId(), content, images: imageUrls },
         { kind: 'assistant', id: assistantId, content: '', status: 'loading', tools: [] },
       ])
       setInput('')
+      if (files.length > 0) clearSelectedImages()
       setStreaming(true)
 
       const controller = new AbortController()
@@ -587,7 +726,7 @@ export function GeneralAgentPage() {
       }
 
       try {
-        await api.generalChatStream(content, currentThread, handlers, controller.signal)
+        await api.generalChatStream(content, currentThread, handlers, controller.signal, imageUrls)
         if (controller.signal.aborted) {
           patchAssistant(assistantId, (item) => ({ ...item, status: 'stopped' }))
         } else {
@@ -613,7 +752,17 @@ export function GeneralAgentPage() {
         void loadSessions()
       }
     },
-    [canChat, loadSessions, patchAssistant, showCompressed, streaming, threadId, upsertSession],
+    [
+      canChat,
+      loadSessions,
+      ossOverview,
+      patchAssistant,
+      showCompressed,
+      streaming,
+      threadId,
+      uploadingImages,
+      upsertSession,
+    ],
   )
 
   const stop = () => {
@@ -624,7 +773,9 @@ export function GeneralAgentPage() {
     if (event.key !== 'Enter' || event.shiftKey) return
     if (event.nativeEvent.isComposing) return
     event.preventDefault()
-    if (!streaming && canChat) void send(input)
+    if (!streaming && !uploadingImages && canChat) {
+      void send(input, selectedImages.map((image) => image.file))
+    }
   }
 
   const refresh = () => {
@@ -853,7 +1004,12 @@ export function GeneralAgentPage() {
                       key={example}
                       icon={<BulbOutlined />}
                       disabled={!canChat}
-                      onClick={() => void send(example)}
+                      onClick={() =>
+                        void send(
+                          example,
+                          selectedImages.map((image) => image.file),
+                        )
+                      }
                     >
                       {example}
                     </Button>
@@ -865,14 +1021,60 @@ export function GeneralAgentPage() {
             )}
           </div>
 
+          {selectedImages.length > 0 && (
+            <div className="chat-image-strip">
+              {selectedImages.map((image) => (
+                <div className="chat-image-chip" key={image.id}>
+                  <img src={image.preview} alt={image.file.name} />
+                  <span className="chat-image-name" title={image.file.name}>
+                    {image.file.name}
+                  </span>
+                  <Button
+                    type="text"
+                    size="small"
+                    aria-label={`移除 ${image.file.name}`}
+                    icon={<CloseOutlined />}
+                    disabled={streaming || uploadingImages}
+                    onClick={() => removeSelectedImage(image.id)}
+                  />
+                </div>
+              ))}
+            </div>
+          )}
           <div className="chat-composer">
+            <Upload
+              multiple
+              accept={ossOverview?.accepted_suffixes.join(',') ?? 'image/*'}
+              showUploadList={false}
+              beforeUpload={addImages}
+              disabled={!canChat || streaming || uploadingImages}
+            >
+              <Tooltip
+                title={
+                  ossOverview?.configured && ossOverview.access_configured
+                    ? `添加图片（可多选，最多 ${MAX_CHAT_IMAGES} 张）`
+                    : '私域 OSS 未配置，暂时不能上传图片'
+                }
+              >
+                <Button
+                  icon={<PictureOutlined />}
+                  disabled={
+                    !canChat ||
+                    streaming ||
+                    uploadingImages ||
+                    !ossOverview?.configured ||
+                    !ossOverview.access_configured
+                  }
+                />
+              </Tooltip>
+            </Upload>
             <Input.TextArea
               autoSize={{ minRows: 2, maxRows: 6 }}
               value={input}
               disabled={!canChat}
               placeholder={
                 canChat
-                  ? '描述你想让 Agent 完成的任务，Enter 发送，Shift + Enter 换行'
+                  ? '描述你想让 Agent 完成的任务；可添加图片，Enter 发送，Shift + Enter 换行'
                   : '模型或 MySQL 会话记忆未就绪，请先完成配置'
               }
               onChange={(event) => setInput(event.target.value)}
@@ -886,10 +1088,20 @@ export function GeneralAgentPage() {
               <Button
                 type="primary"
                 icon={<SendOutlined />}
-                disabled={!canChat || !input.trim()}
-                onClick={() => void send(input)}
+                loading={uploadingImages}
+                disabled={
+                  !canChat ||
+                  uploadingImages ||
+                  (!input.trim() && selectedImages.length === 0)
+                }
+                onClick={() =>
+                  void send(
+                    input,
+                    selectedImages.map((image) => image.file),
+                  )
+                }
               >
-                发送
+                {uploadingImages ? '上传中' : '发送'}
               </Button>
             )}
           </div>

@@ -564,3 +564,69 @@ export interface AgentChatStreamHandlers {
   }) => void
   onError?: (message: string) => void
 }
+
+/* ---- 私域 OSS（与后端 `ai_agent_py.alioss.models` 对应）------------------ */
+
+/** `GET /api/oss/overview`：私有 Bucket 配置与访问要求（不含密钥）。 */
+export interface OssOverview {
+  configured: boolean
+  access_configured: boolean
+  access_required: boolean
+  bucket: string | null
+  endpoint: string | null
+  region: string
+  prefix: string
+  /** OSS 直链有效期（秒）。 */
+  url_expires: number
+  max_file_mb: number
+  accepted_suffixes: string[]
+  warnings: string[]
+}
+
+/** 上传成功后的图片信息与 OSS 直链。 */
+export interface OssImage {
+  key: string
+  name: string
+  size: number
+  content_type: string
+  etag: string | null
+  /** OSS 直链（预签名 GET，可直接放 `<img>`）。 */
+  url: string
+  /** OSS 直链（Content-Disposition: attachment）。 */
+  download_url: string
+  /** 上述直链的有效期（秒）。 */
+  expires_in: number
+  uploaded_at: string
+}
+
+/** `GET /api/oss/objects` 里的一个对象。 */
+export interface OssObject {
+  key: string
+  name: string
+  size: number
+  content_type: string
+  last_modified: string | null
+  /** OSS 直链（预签名 GET）。 */
+  url: string
+  /** OSS 直链（附件下载）。 */
+  download_url: string
+  /** 上述直链的有效期（秒）。 */
+  expires_in: number
+}
+
+/** `GET /api/oss/presign`：按对象键换取新的 OSS 直链。 */
+export interface OssPresign {
+  key: string
+  url: string
+  download_url: string
+  expires_in: number
+}
+
+export interface OssObjectList {
+  prefix: string
+  count: number
+  truncated: boolean
+  next_marker: string | null
+  objects: OssObject[]
+}
+

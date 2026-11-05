@@ -1,6 +1,7 @@
 import {
   AppstoreOutlined,
   AuditOutlined,
+  CloudServerOutlined,
   DatabaseOutlined,
   FileSearchOutlined,
   MenuFoldOutlined,
@@ -41,6 +42,11 @@ const MENU_ITEMS: MenuProps['items'] = [
       { key: '/agents/general', icon: <ThunderboltOutlined />, label: '通用 Agent' },
     ],
   },
+  {
+    key: '/oss',
+    icon: <CloudServerOutlined />,
+    label: '私域 OSS',
+  },
 ]
 
 /** 路由 → 面包屑标题；未登记的路径回落到文档解析。 */
@@ -51,6 +57,7 @@ const PAGE_TITLES: Record<string, string> = {
   '/agents': '应用列表',
   '/agents/reimburse': '报销审核',
   '/agents/general': '通用 Agent',
+  '/oss': '图片上传与访问',
 }
 
 function readSiderCollapsed(): boolean {
@@ -67,8 +74,11 @@ export function AdminLayout() {
   const navigate = useNavigate()
   const selectedKeys = [location.pathname]
   const isAgentSection = location.pathname.startsWith('/agents')
-  const sectionTitle = isAgentSection ? 'Agent 应用' : 'RAG 管理'
-  const pageTitle = PAGE_TITLES[location.pathname] ?? (isAgentSection ? '应用列表' : '文档解析')
+  const isOssSection = location.pathname.startsWith('/oss')
+  const sectionTitle = isOssSection ? '私域 OSS' : isAgentSection ? 'Agent 应用' : 'RAG 管理'
+  const pageTitle =
+    PAGE_TITLES[location.pathname] ??
+    (isOssSection ? '图片上传与访问' : isAgentSection ? '应用列表' : '文档解析')
   const [collapsed, setCollapsed] = useState(readSiderCollapsed)
   const toggleLabel = collapsed ? '展开侧栏' : '收起侧栏'
 
@@ -114,7 +124,7 @@ export function AdminLayout() {
         {!collapsed && (
           <div className="sider-footer">
             <div>ai-agent-py v0.1.0</div>
-            <div>MinerU · Milvus · LangGraph</div>
+            <div>MinerU · Milvus · OSS</div>
           </div>
         )}
       </Sider>

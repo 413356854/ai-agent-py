@@ -17,8 +17,10 @@ token 估算用 ``langchain_core`` 的 ``count_tokens_approximately``；默认�
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMessage
 from langchain_core.messages.utils import count_tokens_approximately
@@ -252,6 +254,43 @@ def _message_text(message: AnyMessage) -> str:
     return str(content)
 
 
+#: 历史用户消息里由 `_user_text` 追加的 Markdown 图片链接。
+IMAGE_MARKDOWN = re.compile(r"!\[[^\]]*\]\((https?://[^)\s]+)\)")
+
+
+def _user_content_blocks(
+    content: str,
+    *,
+    max_chars: int,
+    head_chars: int,
+    tail_chars: int,
+) -> str | list[Any]:
+    """历史用户消息 → 文本 / LangChain 标准图片内容块。
+
+    MySQL 里存的是「文字 + Markdown 图片链接」，回放时把链接还原成
+    ``{"type": "image", "url": ...}``，这样视觉模型在后续轮次仍能看到图片；
+    没有图片的旧消息保持纯字符串，行为不变。
+    """
+    urls = IMAGE_MARKDOWN.findall(content)
+    if not urls:
+        return clip_text(
+            content,
+            max_chars=max_chars,
+            head_chars=head_chars,
+            tail_chars=tail_chars,
+        )
+    text = IMAGE_MARKDOWN.sub("", content).strip() or "（用户上传了图片）"
+    clipped = clip_text(
+        text,
+        max_chars=max_chars,
+        head_chars=head_chars,
+        tail_chars=tail_chars,
+    )
+    blocks: list[Any] = [{"type": "text", "text": clipped}]
+    blocks.extend({"type": "image", "url": url} for url in urls)
+    return blocks
+
+
 def record_to_message(
     record: ChatMessage,
     *,
@@ -264,14 +303,21 @@ def record_to_message(
         return None
     if not record.content.strip():
         return None
+    if record.role == "user":
+        return HumanMessage(
+            content=_user_content_blocks(
+                record.content,
+                max_chars=max_chars,
+                head_chars=head_chars,
+                tail_chars=tail_chars,
+            )
+        )
     content = clip_text(
         record.content,
         max_chars=max_chars,
         head_chars=head_chars,
         tail_chars=tail_chars,
     )
-    if record.role == "user":
-        return HumanMessage(content=content)
     return AIMessage(content=content)
 
 
