@@ -125,6 +125,24 @@ def test_agent_tool_settings() -> None:
         Settings(_env_file=None, web_extractor_max_chars=0)
 
 
+def test_agent_loop_budget_settings() -> None:
+    cfg = Settings(_env_file=None)
+    assert cfg.agent_max_turns >= 1
+    assert cfg.agent_max_tool_calls >= 1
+    assert cfg.agent_max_tokens == 0
+    assert cfg.agent_max_seconds > 0
+    assert "steps<=8" in cfg.describe()["agent_budget"]
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, agent_max_turns=0)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, agent_max_tool_calls=0)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, agent_max_tokens=-1)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, agent_max_seconds=-1)
+
+
 def test_web_search_key_prefers_dedicated_then_dashscope(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DASHSCOPE_API_KEY", "sk-dashscope")
     assert Settings(_env_file=None).resolved_web_search_api_key == "sk-dashscope"

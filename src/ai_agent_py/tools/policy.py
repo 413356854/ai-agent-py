@@ -25,6 +25,11 @@ Design notes
 * ``concurrent=False`` serialises a tool (file writes and shell commands may
   touch shared state); the other calls of the same model turn still run in
   parallel.
+* ``dedupe=True`` lets the tool node skip a **repeated identical** call of a
+  read-only retrieval tool within one turn (same name + same arguments), so the
+  model cannot keep re-searching the same query.  Side-effecting tools and
+  filesystem reads are never deduped: re-reading a file after editing it is a
+  legitimate pattern.
 """
 
 from __future__ import annotations
@@ -55,6 +60,7 @@ __all__ = [
     "ToolPolicies",
     "ToolPolicy",
     "ToolPolicyView",
+    "is_failure_result",
     "is_retryable_exception",
     "is_transient_result",
     "retry_delay",
@@ -75,6 +81,7 @@ class ToolPolicyView(TypedDict):
     max_retries: int
     risk_level: str
     concurrent: bool
+    dedupe: bool
 
 
 #: 工具结果落 ``ToolMessage.artifact['raw']`` 的兜底上限（字符）。
@@ -104,6 +111,8 @@ class ToolPolicy:
     max_retries: int = 1
     risk_level: RiskLevel = "low"
     concurrent: bool = True
+    #: 同一轮里「同名 + 同参数」的重复调用是否直接跳过（只读检索类工具打开）。
+    dedupe: bool = False
 
     def __post_init__(self) -> None:
         if self.timeout is not None and self.timeout <= 0:
@@ -137,6 +146,7 @@ class ToolPolicies:
             max_retries=policy.max_retries,
             risk_level=policy.risk_level,
             concurrent=policy.concurrent and self.parallel,
+            dedupe=policy.dedupe,
         )
 
     @classmethod
@@ -162,12 +172,13 @@ class ToolPolicies:
             max_retries=retries,
         )
         policies: dict[str, ToolPolicy] = {
-            # 检索是只读 + 网络调用：可重试，超时给短一点。
+            # 检索是只读 + 网络调用：可重试，超时给短一点；同一轮重复同样的查询直接跳过。
             KNOWLEDGE_TOOL_NAME: ToolPolicy(
                 timeout=timeout,
                 max_output_chars=DEFAULT_MAX_OUTPUT_CHARS,
                 retryable=True,
                 max_retries=retries,
+                dedupe=True,
             ),
             READ_TOOL_NAME: ToolPolicy(
                 timeout=timeout,
@@ -208,12 +219,14 @@ class ToolPolicies:
                 max_output_chars=100_000,
                 retryable=True,
                 max_retries=retries,
+                dedupe=True,
             ),
             WEB_EXTRACT_TOOL_NAME: ToolPolicy(
                 timeout=cfg.web_extractor_timeout + TIMEOUT_GRACE_SECONDS,
                 max_output_chars=100_000,
                 retryable=True,
                 max_retries=retries,
+                dedupe=True,
             ),
         }
         if overrides:
@@ -266,6 +279,11 @@ def is_retryable_exception(exc: BaseException) -> bool:
     return isinstance(exc, _RETRYABLE_EXCEPTIONS)
 
 
+def is_failure_result(text: str) -> bool:
+    """True when a tool result string is a known failure (not a normal answer)."""
+    return text.lstrip().startswith(_ERROR_PREFIXES)
+
+
 def is_transient_result(text: str) -> bool:
     """True when a tool's ``错误：...`` result looks like a transient failure.
 
@@ -273,10 +291,9 @@ def is_transient_result(text: str) -> bool:
     breaks the graph); this is how the node recognises the subset that a retry
     can plausibly fix.
     """
-    head = text.lstrip()
-    if not head.startswith(_ERROR_PREFIXES):
+    if not is_failure_result(text):
         return False
-    lowered = head.lower()
+    lowered = text.lstrip().lower()
     return any(hint in lowered for hint in _TRANSIENT_HINTS)
 
 

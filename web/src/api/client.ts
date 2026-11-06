@@ -1,4 +1,5 @@
 import type {
+  AgentBudgetStats,
   AgentChatMessage,
   AgentChatMessageList,
   AgentChatResponse,
@@ -501,6 +502,7 @@ async function streamGeneralChat(
         tool_calls: Number(payload.tool_calls ?? 0),
         elapsed_ms: Number(payload.elapsed_ms ?? 0),
         context: (payload.context ?? {}) as AgentContextStats,
+        budget: (payload.budget ?? {}) as AgentBudgetStats,
         summary: (payload.summary ?? null) as AgentChatSummary | null,
         messages: Array.isArray(payload.messages)
           ? (payload.messages as AgentChatMessage[])

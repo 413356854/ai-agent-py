@@ -37,6 +37,7 @@ import dayjs from 'dayjs'
 import { ApiError, api } from '../../api/client'
 import { MarkdownPreview } from '../../components/MarkdownPreview'
 import type {
+  AgentBudgetStats,
   AgentChatMessage,
   AgentChatSession,
   AgentChatStreamHandlers,
@@ -73,11 +74,12 @@ function splitImageMarkdown(content: string): { text: string; images: string[] }
   return { text, images }
 }
 
-type ToolStatus = 'running' | 'ok' | 'error' | 'timeout'
+type ToolStatus = 'running' | 'ok' | 'error' | 'timeout' | 'skipped'
 
-/** 工具状态：后端返回 ok / error / timeout / invalid_args，这里归并成展示用的三态。 */
+/** 工具状态：后端返回 ok / error / timeout / invalid_args / skipped，这里归并成展示用的几态。 */
 function toolStatus(raw: string | null | undefined): ToolStatus {
   if (raw === 'timeout') return 'timeout'
+  if (raw === 'skipped') return 'skipped'
   if (raw && raw !== 'ok') return 'error'
   return 'ok'
 }
@@ -88,14 +90,24 @@ const TOOL_RISK_LABELS: Record<string, string> = {
   high: '高风险',
 }
 
-/** 工具策略的一行摘要（超时 / 重试 / 风险 / 并行）。 */
+/** 预算耗尽原因的中文标签（与后端 graph/budget.py 的 REASON_LABELS 对应）。 */
+const BUDGET_REASON_LABELS: Record<string, string> = {
+  max_steps: '模型调用步数',
+  max_tool_calls: '工具调用次数',
+  max_tokens: 'token 预算',
+  max_seconds: '单轮时间预算',
+  recursion_limit: '图循环上限',
+}
+
+/** 工具策略的一行摘要（超时 / 重试 / 风险 / 并行 / 去重）。 */
 function policySummary(tool: GeneralAgentTool): string {
   const timeout =
     tool.timeout_seconds == null ? '超时由工具自身控制' : `超时 ${tool.timeout_seconds}s`
   const retry = tool.retryable ? `可重试 ${tool.max_retries ?? 1} 次` : '不重试'
   const risk = TOOL_RISK_LABELS[tool.risk_level ?? 'low'] ?? tool.risk_level ?? '低风险'
   const concurrency = tool.concurrent === false ? '串行' : '可并行'
-  return `${timeout} · ${retry} · ${risk} · ${concurrency}`
+  const dedupe = tool.dedupe ? ' · 重复调用跳过' : ''
+  return `${timeout} · ${retry} · ${risk} · ${concurrency}${dedupe}`
 }
 
 interface ToolTrace {
@@ -221,7 +233,9 @@ const ToolCard = memo(function ToolCard({ tool }: { tool: ToolTrace }) {
         ? { color: 'orange', label: '超时' }
         : tool.status === 'error'
           ? { color: 'red', label: '失败' }
-          : { color: 'green', label: '完成' }
+          : tool.status === 'skipped'
+            ? { color: 'default', label: '已跳过' }
+            : { color: 'green', label: '完成' }
   const failed = tool.status === 'error' || tool.status === 'timeout'
 
   return (
@@ -382,6 +396,7 @@ export function GeneralAgentPage() {
   const [toolsOpen, setToolsOpen] = useState(false)
   const [summaryInfo, setSummaryInfo] = useState<AgentChatSummary | null>(null)
   const [lastContext, setLastContext] = useState<AgentContextStats | null>(null)
+  const [lastBudget, setLastBudget] = useState<AgentBudgetStats | null>(null)
   const [showCompressed, setShowCompressed] = useState(false)
   const [compacting, setCompacting] = useState(false)
   const [ossOverview, setOssOverview] = useState<OssOverview | null>(null)
@@ -502,6 +517,7 @@ export function GeneralAgentPage() {
       try {
         const data = await api.generalSessionMessages(session.thread_id)
         setSummaryInfo(data.summary)
+        setLastBudget(null)
         setItems(toItems(data.items, showCompressed))
       } catch (error) {
         toast.error(`读取会话失败：${errorText(error)}`)
@@ -571,6 +587,7 @@ export function GeneralAgentPage() {
           setItems([])
           setSummaryInfo(null)
           setLastContext(null)
+          setLastBudget(null)
           setShowCompressed(false)
         }
         toast.success('会话已从 MySQL 删除')
@@ -626,6 +643,7 @@ export function GeneralAgentPage() {
     clearSelectedImages()
     setSummaryInfo(null)
     setLastContext(null)
+    setLastBudget(null)
     setShowCompressed(false)
   }
 
@@ -716,9 +734,10 @@ export function GeneralAgentPage() {
             status: 'streaming',
             stage: undefined,
           })),
-        onDone: ({ answer, session, messages, context, summary }) => {
+        onDone: ({ answer, session, messages, context, budget, summary }) => {
           upsertSession(session)
           setLastContext(context)
+          setLastBudget(budget)
           setSummaryInfo(summary)
           if (messages.length) {
             // 用 MySQL 里落库的消息替换实时占位，刷新后与回放看到的内容完全一致。
@@ -838,6 +857,23 @@ export function GeneralAgentPage() {
                   )}`
                 : `预算 ${formatTokens(overview.context.history_budget_tokens)}`}
             </Tag>
+          )}
+          {lastBudget && (
+            <Tooltip
+              title={
+                lastBudget.exhausted
+                  ? `已到达预算上限（${
+                      BUDGET_REASON_LABELS[lastBudget.reason ?? ''] ?? lastBudget.reason
+                    }），本轮由 finalize 基于已有资料收尾，信息可能不完整`
+                  : '最近一轮实际用掉的循环预算（模型调用步数 / 工具调用次数）'
+              }
+            >
+              <Tag color={lastBudget.exhausted ? 'red' : 'default'}>
+                预算 {lastBudget.steps}/{lastBudget.max_steps} 步 ·{' '}
+                {lastBudget.tool_calls}/{lastBudget.max_tool_calls} 工具
+                {lastBudget.exhausted ? ' · 已触顶' : ''}
+              </Tag>
+            </Tooltip>
           )}
           {summaryInfo && <Tag color="gold">已压缩 {summaryInfo.source_messages} 条</Tag>}
           {lastContext?.summary_error && (
@@ -1152,7 +1188,12 @@ export function GeneralAgentPage() {
           <>
             <Typography.Paragraph type="secondary" style={{ fontSize: 12 }}>
               全部工具都绑定在同一张 LangGraph 图上，由模型按任务自行选择；文件类工具只能在
-              {overview.workspace} 内读写。最多连续 {overview.max_turns} 轮工具调用。
+              {overview.workspace} 内读写。单轮最多 {overview.budget.max_steps} 次模型调用、
+              {overview.budget.max_tool_calls} 次工具调用
+              {overview.budget.max_seconds > 0
+                ? `、${Math.round(overview.budget.max_seconds)} 秒`
+                : ''}
+              ；预算用尽后由 finalize 基于已有资料收尾，并说明信息可能不完整。
             </Typography.Paragraph>
             <Collapse
               defaultActiveKey={toolGroups.map((group) => group.group)}

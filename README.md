@@ -765,7 +765,8 @@ Invoke-RestMethod "http://127.0.0.1:8000/api/documents/$($job.id)"
 | `DATA_DIR` | `data/raw` | `ingest` 的默认来源目录 |
 | `CHUNK_SIZE` / `CHUNK_OVERLAP` | `800` / `120` | 分块大小与重叠（字符数） |
 | `RETRIEVER_K` | `4` | 最终交给模型的片段数（Milvus 先召回 `MILVUS_CANDIDATES` 条再 RRF/精排） |
-| `AGENT_MAX_TURNS` | `8` | 智能体单轮最多工具调用轮数 |
+| `AGENT_MAX_TURNS` | `8` | 智能体单轮的**步数预算**：最多调用模型几次；用完后走 finalize（`recursion_limit` 只是兜底，由代码换算） |
+| `AGENT_MAX_TOOL_CALLS` / `AGENT_MAX_TOKENS` / `AGENT_MAX_SECONDS` | `24` / `0` / `600` | 单轮工具调用次数上限（被跳过的重复调用不计）、token 预算（0 = 不限，provider 返回 usage 时生效）、墙钟预算（秒，0 = 不限） |
 | `AGENT_MEMORY_CANDIDATES` / `AGENT_MEMORY_SESSIONS` | `200` / `50` | 通用 Agent：从 MySQL 取多少条候选历史（再按 token 预算裁剪）、会话列表默认返回条数 |
 | `AGENT_MODEL_CONTEXT_TOKENS` / `AGENT_CONTEXT_MAX_TOKENS` | `32768` / `0`（自动） | 模型上下文窗口与历史预算上限；实际预算 = 窗口 − 输出预留 − 安全余量 − 系统提示 − 工具 schema |
 | `AGENT_OUTPUT_RESERVE_TOKENS` / `AGENT_CONTEXT_SAFETY_TOKENS` | `2048` / `512` | 为模型输出与估算误差预留的 token |
@@ -866,18 +867,42 @@ chain = build_rag_chain(llm, searcher)  # LCEL: {question} -> {answer, documents
           ┌──────────────────────────────┐
           ▼                              │
 START ──▶ agent ──有 tool_calls？──是──▶ tools
-             │
+             │            │
+             │            └──预算耗尽──▶ finalize ──▶ END
              └──否──▶ END
 ```
 
 - `agent` 节点：把工具绑定到模型后调用一次，返回的 `AIMessage` 追加进 `messages`。
 - `tools` 节点：执行上一条消息里所有 `tool_calls`，把结果作为 `ToolMessage` 回填。
-- 条件边 `route_after_agent`：还有工具调用就继续循环，否则结束。
-- `recursion_limit` 由 `AGENT_MAX_TURNS` 换算，防止无限循环。
+- 条件边 `route_after_agent`：还有工具调用且预算未耗尽就继续循环；预算耗尽走 `finalize`，
+  否则结束。
+- `recursion_limit` 只是兜底，由循环预算换算（`AGENT_MAX_TURNS × 2 + 2`），保证预算先于
+  `GraphRecursionError` 生效。
 - 需要多轮记忆时传入 `checkpointer=InMemorySaver()`（CLI 的 `chat` 与 API 的 `/chat` 已内置）。
 
 新增工具只需在 `tools/__init__.py` 里加函数，再 `build_agent_graph(tools=[...])`，图本身不用改；
 需要专属超时 / 重试 / 并行策略时在 `tools/policy.py` 的 `ToolPolicies` 里登记。
+
+#### 循环预算与 finalize（`graph/budget.py` + `graph/nodes.py`）
+
+一轮对话有四种预算，达到任一上限后**不再调用工具**，改由 `finalize` 节点用已获得的资料
+收尾（系统提示要求「说明信息可能不完整 + 给出下一步建议」）：
+
+| 预算 | 默认 | 说明 |
+| --- | --- | --- |
+| `AGENT_MAX_TURNS` | 8 | 步数：单轮最多调用模型几次 |
+| `AGENT_MAX_TOOL_CALLS` | 24 | 工具调用次数：超出部分直接回「工具调用预算已用尽」 |
+| `AGENT_MAX_TOKENS` | 0（关闭） | token：只在 provider 返回 `usage` 时统计 |
+| `AGENT_MAX_SECONDS` | 600 | 墙钟：只在节点之间检查，不会中断正在跑的工具 |
+
+- 用量**每轮从消息现算**（只统计最后一条 `HumanMessage` 之后的部分），所以带 checkpointer
+  的多轮会话不会把上一轮的步数累计进来；`started_at` 由 `agent` 节点每轮写入一次。
+- 同一轮里重复的只读检索（知识库检索 / 联网搜索 / 网页抓取）按 `(工具名, 参数哈希)` 跳过，
+  `ToolMessage.artifact.status = "skipped"`；失败 / 超时的调用不算「执行过」，允许重试。
+- `finalize` 的模型调用失败或返回空内容时，退化为静态兜底文案（附最后一次工具结果节选），
+  接口不会 502，也不会把 `ToolMessage` 当答案。
+- `GET /api/general-agent/overview` 返回 `budget` 配置；`ChatResponse` / SSE `done` 返回本轮
+  实际用量（`steps / tool_calls / skipped_calls / tokens / exhausted / reason`）。
 
 #### 通用工具（`tools/workspace.py` / `filesystem.py` / `shell.py` / `web_search.py` / `web_extractor.py`）
 
@@ -987,9 +1012,15 @@ START ──▶ condense ──▶ retrieve ──▶ resolve ──▶ answer �
 
 ```text
 START ──▶ agent ──有 tool_calls？──是──▶ tools ──▶ agent ──…──▶ END
-             │                            │
-        选择工具 / 生成回答           执行工具，结果回填
+             │            │
+             │            └──预算耗尽──▶ finalize ──▶ END
+             │
+        选择工具 / 生成回答
 ```
+
+- **循环预算**：步数 / 工具次数 / token / 墙钟四种预算（见「循环预算与 finalize」），
+  达到上限后由 `finalize` 节点基于已获得的资料收尾，所以长任务不会变成 502 或空回答；
+  同一轮重复的只读检索会被跳过，工具卡片上显示「已跳过」。
 
 - **工具全部接入**：`search_knowledge_base`（Milvus `rag_chunk`）、`read` / `write` / `edit` /
   `glob` / `grep`（工作目录内文件）、`shell`（工作目录内命令）、`web_search` /
@@ -1018,13 +1049,14 @@ START ──▶ agent ──有 tool_calls？──是──▶ tools ──▶ 
     原始消息不删除，`GET /sessions/{id}/messages` 返回 `compressed=true` 标记，前端可展开查看。
   - **L4 溢出重试 / 手动压缩**：provider 报 context length 时自动强制再压缩并重试一次；
     `POST /api/general-agent/sessions/{id}/compact` 可手动压缩。
-- **SSE 事件**：压缩过历史时先发 `stage: compact`；常规顺序为 `session` →
-  （`tool_call` → `tool_result`）… → `token`… → `done`（完整答案 + 上下文统计 + 落库消息）；
-  `error` 表示失败。没有工具调用时只有 `session` / `token` / `done`。
+- **SSE 事件**：压缩过历史时先发 `stage: compact`；预算耗尽进入 finalize 时先发
+  `stage: finalize`；常规顺序为 `session` →（`tool_call` → `tool_result`）… → `token`… →
+  `done`（完整答案 + 上下文统计 + 循环预算用量 + 落库消息）；`error` 表示失败。
+  没有工具调用时只有 `session` / `token` / `done`。
 - **前端**：`web/src/pages/agent/GeneralAgentPage.tsx` 左侧是 MySQL 会话列表（可切换 / 删除），
   右侧聊天区把每次工具调用渲染成卡片（可展开看结果），点击示例可直接试用
-  「文件 / 知识库 / 联网」三条路径；页头显示模型、上下文预算、已压缩条数与工具数，
-  可手动「压缩历史」，已压缩消息默认折叠、可展开查看。
+  「文件 / 知识库 / 联网」三条路径；页头显示模型、上下文预算、本轮循环预算（步数 / 工具
+  次数，触顶时标红）、已压缩条数与工具数，可手动「压缩历史」，已压缩消息默认折叠、可展开查看。
 - **失败处理**：没配对话模型 Key → `/overview` 给出提示、对话接口 503；MySQL 未配置 / 未建表 →
   记忆状态标记不可用并提示执行建表脚本（`docs/mysql/` 下三个 SQL），不会静默假装记得。
 - **与 RAG 问答的记忆区别**：RAG 问答用 `InMemorySaver`（进程内、重启即失效）；通用 Agent
@@ -1115,7 +1147,7 @@ uv run ai-agent-py db import-jobs             # 写入 tb_document_parse_job
 ## 开发
 
 ```powershell
-uv run pytest            # 420 个测试，全部离线（MinerU / 精排用 httpx.MockTransport，任务记录库用内存 JobStore，RAG 记录 / 问答用假 Milvus 客户端与脚本化模型；检索链路用 offline.OfflineChunkSearcher）
+uv run pytest            # 453 个测试，全部离线（MinerU / 精排用 httpx.MockTransport，任务记录库用内存 JobStore，RAG 记录 / 问答用假 Milvus 客户端与脚本化模型；检索链路用 offline.OfflineChunkSearcher）
 uv run ruff check .      # 静态检查
 uv run ruff format .     # 格式化
 uv run mypy              # 类型检查（src 目录）
@@ -1225,6 +1257,13 @@ MySQL：`tb_agent_chat_session`（会话）、`tb_agent_chat_message`（消息�
 调用返回「工具执行超时」，图会继续，模型通常会缩小范围后重试。长构建 / 全量测试建议拆成多次
 命令，或让模型显式传更大的 `timeout`。知识库检索与联网工具遇到网络、429、5xx 会自动重试
 `AGENT_TOOL_RETRIES` 次（默认 1）；`AGENT_TOOL_PARALLEL=false` 可关闭同一轮的并行执行。
+
+**回答里说「信息可能不完整」/ 显示「预算已触顶」？**
+这说明本轮达到了循环预算，`finalize` 节点用了已经拿到的工具结果作答，而不是继续调用工具。
+页头会显示「预算 x/y 步 · a/b 工具」，触顶时为红色。可以按需要调大 `AGENT_MAX_TURNS`
+（步数）、`AGENT_MAX_TOOL_CALLS`（工具次数）、`AGENT_MAX_SECONDS`（墙钟，0 = 不限），
+或把任务拆小；`AGENT_MAX_TOKENS` 默认 0（不限），只有 provider 返回 usage 时才统计。
+同一轮里重复的相同检索会被跳过（工具卡片显示「已跳过」），失败 / 超时的调用仍允许重试。
 
 **亮色 / 暗色主题怎么切换？**
 页面右上角的月亮 / 太阳按钮，选择保存在浏览器 `localStorage`，刷新或重启服务都保持；

@@ -55,7 +55,17 @@ class Settings(BaseSettings):
     llm_temperature: float = 0.0
     llm_max_tokens: int | None = None
     llm_timeout: float = 60.0
+    # ---- 智能体循环预算（graph/budget.py，A-02）--------------------------
+    # AGENT_MAX_TURNS 是「步数预算」：单轮最多调用模型几次；用完后走 finalize 节点
+    # 基于已有资料作答，而不是抛 GraphRecursionError。recursion_limit 只是兜底
+    # （= 预算步数 × 2 + 2），两者取较大值。
     agent_max_turns: int = 8
+    # 单轮最多真正执行多少次工具调用；同一个调用被跳过（重复 / 超预算）不计入。
+    agent_max_tool_calls: int = 24
+    # 单轮 token 预算；0 = 不限制。只有 provider 返回 usage 时才能统计。
+    agent_max_tokens: int = 0
+    # 单轮墙钟预算（秒）；0 = 不限制。只在 agent 节点返回后检查，不会中断正在跑的工具。
+    agent_max_seconds: float = 600.0
 
     # ---- 通用 agent 工具（read / write / edit / glob / grep / shell）----
     # 文件工具只能读写这个目录内的路径，shell 的 cwd 也限制在这里。
@@ -457,6 +467,11 @@ class Settings(BaseSettings):
                 f"timeout={self.agent_tool_timeout:g}s, retries={self.agent_tool_retries}, "
                 f"parallel={'on' if self.agent_tool_parallel else 'off'}"
             ),
+            "agent_budget": (
+                f"steps<={self.agent_max_turns}, tool_calls<={self.agent_max_tool_calls}, "
+                f"tokens={self.agent_max_tokens or 'off'}, "
+                f"seconds={self.agent_max_seconds or 'off'}"
+            ),
             "agent_memory": (
                 f"mysql, candidates={self.agent_memory_candidates}, "
                 f"sessions={self.agent_memory_sessions}"
@@ -717,6 +732,27 @@ class Settings(BaseSettings):
     def _non_negative_tool_retries(cls, value: int) -> int:
         if value < 0:
             raise ValueError("AGENT_TOOL_RETRIES 不能为负数")
+        return value
+
+    @field_validator("agent_max_turns", "agent_max_tool_calls", mode="after")
+    @classmethod
+    def _positive_loop_budget(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("AGENT_MAX_TURNS / AGENT_MAX_TOOL_CALLS 必须是正整数")
+        return value
+
+    @field_validator("agent_max_tokens", mode="after")
+    @classmethod
+    def _non_negative_max_tokens(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("AGENT_MAX_TOKENS 不能为负数（0 = 不限制）")
+        return value
+
+    @field_validator("agent_max_seconds", mode="after")
+    @classmethod
+    def _non_negative_max_seconds(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError("AGENT_MAX_SECONDS 不能为负数（0 = 不限制）")
         return value
 
     @field_validator("agent_memory_sessions", mode="after")

@@ -42,6 +42,7 @@ from langchain_core.messages import (
     HumanMessage,
     ToolMessage,
 )
+from langgraph.errors import GraphRecursionError
 from pydantic import BaseModel, Field
 
 from ai_agent_py.alioss.service import OssImageService
@@ -72,6 +73,14 @@ from ai_agent_py.general.context import (
 )
 from ai_agent_py.general.summary import SummaryError, summarize_history
 from ai_agent_py.graph.agent import agent_config, message_text
+from ai_agent_py.graph.budget import (
+    LoopBudget,
+    TurnUsage,
+    measure_turn,
+    tool_status,
+    usage_tokens,
+)
+from ai_agent_py.graph.nodes import NO_FINAL_ANSWER
 from ai_agent_py.llm import get_chat_model
 from ai_agent_py.tools.policy import ToolPolicies
 from ai_agent_py.tools.shell import SHELL_TOOL_NAME
@@ -153,6 +162,10 @@ class ToolOut(BaseModel):
     max_retries: int = Field(default=0, description="最多重试次数")
     risk_level: str = Field(default="low", description="low / medium / high")
     concurrent: bool = Field(default=True, description="同一轮是否与其他工具并行执行")
+    dedupe: bool = Field(
+        default=False,
+        description="同一轮里重复的相同调用是否直接跳过（只读检索类工具开启）",
+    )
 
 
 class ContextConfigOut(BaseModel):
@@ -187,6 +200,34 @@ class ContextOut(BaseModel):
     summary_error: str | None = None
 
 
+class BudgetConfigOut(BaseModel):
+    """概览页展示的循环预算配置（A-02）。"""
+
+    max_steps: int = Field(description="单轮最多模型调用次数（AGENT_MAX_TURNS）")
+    max_tool_calls: int = Field(description="单轮最多真正执行的工具调用次数")
+    max_tokens: int = Field(description="单轮 token 预算；0 = 不限制")
+    max_seconds: float = Field(description="单轮墙钟预算（秒）；0 = 不限制")
+
+
+class BudgetOut(BaseModel):
+    """一轮对话实际用掉的循环预算，以及是否触顶（触顶后会走 finalize）。"""
+
+    steps: int
+    tool_calls: int
+    skipped_calls: int = Field(default=0, description="被跳过的调用：重复检索 / 超出工具预算")
+    tokens: int = 0
+    elapsed_seconds: float = 0.0
+    max_steps: int
+    max_tool_calls: int
+    max_tokens: int = 0
+    max_seconds: float = 0.0
+    exhausted: bool = False
+    reason: str | None = Field(
+        default=None,
+        description="max_steps / max_tool_calls / max_tokens / max_seconds / recursion_limit",
+    )
+
+
 class MemoryStatusOut(BaseModel):
     configured: bool = Field(description="是否配置了 MYSQL_URL")
     ok: bool = Field(description="会话记忆表是否可读写")
@@ -208,6 +249,7 @@ class OverviewOut(BaseModel):
     tools: list[ToolOut]
     memory: MemoryStatusOut
     context: ContextConfigOut
+    budget: BudgetConfigOut
     warnings: list[str] = Field(default_factory=list)
 
 
@@ -323,6 +365,7 @@ class ChatResponse(BaseModel):
     tool_calls: int
     elapsed_ms: float
     context: ContextOut
+    budget: BudgetOut
     summary: SummaryOut | None = None
     messages: list[MessageOut] = Field(
         default_factory=list, description="本轮新增的助手 / 工具消息"
@@ -395,6 +438,7 @@ def overview() -> OverviewOut:
     )
     policies = ToolPolicies.from_settings(cfg)
     metas = describe_tools(tools)
+    loop_budget = LoopBudget.from_settings(cfg)
     return OverviewOut(
         ready=llm_configured and memory.ok,
         llm_model=cfg.general_agent_model or cfg.llm_model,
@@ -414,6 +458,7 @@ def overview() -> OverviewOut:
         ],
         memory=memory,
         context=context,
+        budget=BudgetConfigOut.model_validate(loop_budget.describe()),
         warnings=warnings,
     )
 
@@ -635,6 +680,12 @@ def chat(payload: ChatRequest) -> ChatResponse:
     except AiAgentError as exc:
         raise _memory_error(exc) from exc
 
+    loop_budget = LoopBudget.from_settings(cfg)
+    budget = _budget_out(
+        loop_budget,
+        _usage_of_turn(loop_budget, result, new_messages, started),
+        _budget_reason(result),
+    )
     return ChatResponse(
         answer=answer,
         thread_id=thread_id,
@@ -642,6 +693,7 @@ def chat(payload: ChatRequest) -> ChatResponse:
         tool_calls=sum(1 for row in rows if row.role == "tool"),
         elapsed_ms=round((time.perf_counter() - started) * 1000, 2),
         context=context.stats,
+        budget=budget,
         summary=_summary_out(context.summary_row),
         messages=[_message_out(message) for message in persisted],
     )
@@ -705,6 +757,7 @@ def _stream_events(
         *context.messages,
         HumanMessage(content=model_content),
     ]
+    loop_budget = LoopBudget.from_settings(settings)
     call_meta: dict[str, dict[str, Any]] = {}
     tool_started: dict[str, float] = {}
     tool_rows: list[ChatMessage] = []
@@ -712,6 +765,12 @@ def _stream_events(
     streamed = ""
     emitted = False
     attempts = 0
+    steps = 0
+    tool_calls_used = 0
+    skipped_calls = 0
+    tokens = 0
+    budget_reason: str | None = None
+    finalize_stage_sent = False
 
     while True:
         try:
@@ -720,16 +779,26 @@ def _stream_events(
                 "Iterator[tuple[str, Any]]",
                 graph.stream(
                     {"messages": prompt_messages, "summary": context.summary},
-                    agent_config(max_turns=settings.agent_max_turns),
+                    agent_config(max_turns=settings.agent_max_turns, settings=settings),
                     stream_mode=["messages", "updates"],
                 ),
             )
             for mode, chunk in stream:
                 if mode == "messages":
                     message, metadata = chunk
-                    # 只转发 agent 节点真正生成的 token；工具节点的输出走 tool_result。
-                    if metadata.get("langgraph_node") != "agent":
+                    node = metadata.get("langgraph_node")
+                    # 只转发 agent / finalize 节点真正生成的 token；工具输出走 tool_result。
+                    if node not in {"agent", "finalize"}:
                         continue
+                    if node == "finalize" and not finalize_stage_sent:
+                        finalize_stage_sent = True
+                        yield _sse(
+                            "stage",
+                            {
+                                "stage": "finalize",
+                                "message": "执行预算已用尽，正在基于已获得的资料收尾…",
+                            },
+                        )
                     if not isinstance(message, AIMessageChunk):
                         continue
                     text = message_text(message)
@@ -749,17 +818,35 @@ def _stream_events(
                         if node == "agent":
                             for item in messages:
                                 if isinstance(item, AIMessage):
+                                    steps += 1
+                                    tokens += usage_tokens(item)
                                     if item.tool_calls:
                                         emitted = True
                                     yield from _agent_update_events(item, call_meta, tool_started)
                                     text = message_text(item).strip()
                                     if text and not item.tool_calls:
                                         answer = text
+                        elif node == "finalize":
+                            # 预算耗尽后的收尾答案；reason 由 finalize 节点写入状态。
+                            budget_reason = str(update.get("budget_reason") or "max_steps")
+                            for item in messages:
+                                if isinstance(item, AIMessage):
+                                    steps += 1
+                                    tokens += usage_tokens(item)
+                                    text = message_text(item).strip()
+                                    if text:
+                                        emitted = True
+                                        answer = text
                         elif node == "tools":
                             for item in messages:
                                 if not isinstance(item, ToolMessage):
                                     continue
                                 emitted = True
+                                artifact_status = tool_status(item)
+                                if artifact_status == "skipped":
+                                    skipped_calls += 1
+                                else:
+                                    tool_calls_used += 1
                                 info = call_meta.get(item.tool_call_id, {})
                                 content = _clip_tool_result(_tool_output(item))
                                 status = _tool_status(content, item)
@@ -797,6 +884,13 @@ def _stream_events(
             break
         except GeneratorExit:
             raise
+        except GraphRecursionError:
+            # 兜底：预算路由本应先走 finalize，这里只防自定义图 / 手工 recursion_limit。
+            logger.warning("通用 Agent 达到 recursion_limit，改用兜底答案")
+            budget_reason = "recursion_limit"
+            answer = NO_FINAL_ANSWER
+            yield _sse("token", {"text": answer})
+            break
         except Exception as exc:  # 上游模型 / 工具执行错误
             if (
                 _is_context_overflow(exc)
@@ -857,6 +951,13 @@ def _stream_events(
         return
 
     summary_payload = _summary_out(context.summary_row)
+    usage = TurnUsage(
+        steps=steps,
+        tool_calls=tool_calls_used,
+        skipped_calls=skipped_calls,
+        tokens=tokens,
+        elapsed_seconds=time.perf_counter() - started,
+    )
     yield _sse(
         "done",
         {
@@ -866,6 +967,7 @@ def _stream_events(
             "tool_calls": len(tool_rows),
             "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
             "context": context.stats.model_dump(),
+            "budget": _budget_out(loop_budget, usage, budget_reason).model_dump(),
             "summary": summary_payload.model_dump() if summary_payload is not None else None,
             "messages": [_message_out(message).model_dump() for message in persisted],
         },
@@ -1061,13 +1163,54 @@ def _invoke_graph(
     summary: str,
     cfg: Settings,
 ) -> dict[str, Any]:
-    return cast(
-        "dict[str, Any]",
-        graph.invoke(
-            {"messages": messages, "summary": summary},
-            agent_config(max_turns=cfg.agent_max_turns),
-        ),
+    try:
+        return cast(
+            "dict[str, Any]",
+            graph.invoke(
+                {"messages": messages, "summary": summary},
+                agent_config(max_turns=cfg.agent_max_turns, settings=cfg),
+            ),
+        )
+    except GraphRecursionError:
+        # 兜底：循环预算本应先走 finalize 节点；这里把上限截断变成可读的 finalize 文案。
+        logger.warning("通用 Agent 达到 recursion_limit，改用兜底答案")
+        return {
+            "messages": [*messages, AIMessage(content=NO_FINAL_ANSWER)],
+            "budget_reason": "recursion_limit",
+        }
+
+
+def _budget_out(budget: LoopBudget, usage: TurnUsage, reason: str | None) -> BudgetOut:
+    return BudgetOut(
+        steps=usage.steps,
+        tool_calls=usage.tool_calls,
+        skipped_calls=usage.skipped_calls,
+        tokens=usage.tokens,
+        elapsed_seconds=round(usage.elapsed_seconds, 2),
+        max_steps=budget.max_steps,
+        max_tool_calls=budget.max_tool_calls,
+        max_tokens=budget.max_tokens,
+        max_seconds=budget.max_seconds,
+        exhausted=reason is not None,
+        reason=reason,
     )
+
+
+def _budget_reason(result: dict[str, Any]) -> str | None:
+    reason = result.get("budget_reason")
+    return str(reason) if reason else None
+
+
+def _usage_of_turn(
+    budget: LoopBudget,
+    result: dict[str, Any],
+    new_messages: Sequence[AnyMessage],
+    started: float,
+) -> TurnUsage:
+    """优先用图返回的状态（含 started_at）；兜底结果没有时退化为消息 + 请求耗时。"""
+    if isinstance(result.get("started_at"), (int, float)):
+        return budget.usage(result)
+    return measure_turn(new_messages, elapsed_seconds=time.perf_counter() - started)
 
 
 def _is_context_overflow(exc: Exception) -> bool:
@@ -1139,10 +1282,12 @@ def _collect_turn(messages: Sequence[AnyMessage]) -> tuple[str, list[ChatMessage
                 )
             )
 
-    if not answer and messages:
-        answer = message_text(messages[-1]).strip()
-    if answer:
-        rows.append(ChatMessage(role="assistant", content=answer))
+    if not answer:
+        # 没有最终 AI 回答（预算耗尽 / 模型只回了工具调用）：不要再把最后一条消息
+        # ——通常是 ToolMessage——当答案返回（D-03 / A-02）。
+        logger.warning("本轮没有最终 AI 回答，返回 finalize 兜底文案")
+        answer = NO_FINAL_ANSWER
+    rows.append(ChatMessage(role="assistant", content=answer))
     return answer, rows
 
 

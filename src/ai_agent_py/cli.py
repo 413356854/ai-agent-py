@@ -365,13 +365,16 @@ def chat(
         str, typer.Option("--thread-id", help="会话 ID（用于保留上下文）")
     ] = "cli",
     max_turns: Annotated[
-        int | None, typer.Option("--max-turns", help="单轮最多工具调用次数")
+        int | None, typer.Option("--max-turns", help="单轮最多模型调用次数（覆盖 AGENT_MAX_TURNS）")
     ] = None,
 ) -> None:
     """交互式对话（LangGraph agent，会调用检索工具）。"""
     from langgraph.checkpoint.memory import InMemorySaver
 
     cfg = get_settings()
+    if max_turns is not None:
+        # 预算在构图时注入：只改 recursion_limit 会让预算与上限对不上（A-02）。
+        cfg = cfg.model_copy(update={"agent_max_turns": max(1, max_turns)})
     try:
         llm = get_chat_model(cfg)
         searcher = get_milvus_searcher(cfg)
@@ -379,7 +382,7 @@ def chat(
         raise _fail(str(exc)) from exc
 
     saver = InMemorySaver()
-    graph = build_agent_graph(llm=llm, searcher=searcher, checkpointer=saver)
+    graph = build_agent_graph(llm=llm, searcher=searcher, checkpointer=saver, settings=cfg)
     console.print(
         Panel(
             "输入问题开始对话；[bold]/reset[/] 清空上下文，[bold]/exit[/] 退出。",
@@ -409,7 +412,7 @@ def chat(
 
         try:
             with console.status("[cyan]思考中…", spinner="dots"):
-                answer = ask_agent(graph, text, thread_id=thread_id, max_turns=max_turns)
+                answer = ask_agent(graph, text, thread_id=thread_id, settings=cfg)
         except Exception as exc:  # keep the REPL alive
             console.print(f"[red]出错：{exc}[/]")
             continue

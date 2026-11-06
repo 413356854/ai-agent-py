@@ -21,18 +21,24 @@ ReAct 循环），这里只负责「工具清单 + 提示词」。
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NotRequired
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AnyMessage, SystemMessage
+from langchain_core.messages import AnyMessage, HumanMessage, SystemMessage
 from langchain_core.tools import BaseTool
 from langgraph.graph import END, START, StateGraph
 
 from ai_agent_py.config import Settings, get_settings
 from ai_agent_py.general.context import clip_tool_result, compress_tool_messages
-from ai_agent_py.graph.nodes import build_tool_node, route_after_agent
+from ai_agent_py.graph.budget import LoopBudget
+from ai_agent_py.graph.nodes import (
+    build_finalize_node,
+    build_route_after_agent,
+    build_tool_node,
+)
 from ai_agent_py.graph.state import AgentState
 from ai_agent_py.llm import get_chat_model
 from ai_agent_py.rag.milvus_search import DocumentSearcher, get_milvus_searcher
@@ -176,15 +182,18 @@ def build_general_agent_graph(
 ) -> CompiledStateGraph:
     """编译通用 Agent 图（``agent`` 节点 + ``tools`` 节点 + 条件边）。
 
-    与通用 ReAct 图相比多了两处上下文预算：
+    与通用 ReAct 图相比多了三处：
 
     * ``tools`` 节点的结果先做「头 + 标记 + 尾」修剪，完整结果放 ``artifact``；
     * ``agent`` 节点每次调模型前，把本轮较早的工具输出压缩成占位（保留工具配对），
-      并把状态里的 ``summary``（更早历史的摘要）拼进系统提示词。
+      并把状态里的 ``summary``（更早历史的摘要）拼进系统提示词；
+    * 循环预算用尽时走 ``finalize`` 节点（A-02）：基于已有资料作答并说明信息可能
+      不完整，不会抛 ``GraphRecursionError`` 变成 502。
     """
     cfg = settings or get_settings()
     model = llm or get_chat_model(cfg, streaming=True)
     tool_list = list(tools) if tools is not None else build_general_tools(cfg)
+    budget = LoopBudget.from_settings(cfg)
 
     agent_node = _build_general_agent_node(
         model,
@@ -196,14 +205,28 @@ def build_general_agent_graph(
         tool_list,
         result_formatter=lambda text: clip_tool_result(text, cfg),
         settings=cfg,
+        budget=budget,
+    )
+    finalize_node = build_finalize_node(
+        model,
+        system_prompt=system_prompt,
+        budget=budget,
+        compressor=lambda messages: _compress_prompt(cfg, messages),
+        system_extra=lambda state: summary_block(str(state.get("summary") or "")),
     )
 
     builder = StateGraph(GeneralAgentState)
     builder.add_node("agent", agent_node)  # type: ignore[call-overload]
     builder.add_node("tools", tool_node)  # type: ignore[call-overload]
+    builder.add_node("finalize", finalize_node)  # type: ignore[call-overload]
     builder.add_edge(START, "agent")
-    builder.add_conditional_edges("agent", route_after_agent, {"tools": "tools", "end": END})
+    builder.add_conditional_edges(
+        "agent",
+        build_route_after_agent(budget),
+        {"tools": "tools", "finalize": "finalize", "end": END},
+    )
     builder.add_edge("tools", "agent")
+    builder.add_edge("finalize", END)
     return builder.compile()
 
 
@@ -217,24 +240,40 @@ def _build_general_agent_node(
     """构造通用 Agent 的模型节点：系统提示 + 摘要 + 工具预算压缩。"""
     model = llm.bind_tools(tools) if tools else llm
 
-    def agent_node(state: GeneralAgentState) -> dict[str, list[AnyMessage]]:
+    def agent_node(state: GeneralAgentState) -> dict[str, Any]:
         messages: list[AnyMessage] = list(state["messages"])
-        summary = str(state.get("summary") or "").strip()
-        system = system_prompt
-        if summary:
-            system = (
-                f"{system_prompt}\n\n【更早对话摘要（已压缩）】\n{summary}\n\n"
-                "把这段摘要当作已确立的背景继续工作，不要重复确认或复述它。"
-            )
+        update: dict[str, Any] = {}
+        if messages and isinstance(messages[-1], HumanMessage):
+            # 每轮第一次调用模型时记下开始时间，供时间预算使用（每轮覆盖）。
+            update["started_at"] = time.monotonic()
+        system = _system_with_summary(system_prompt, str(state.get("summary") or ""))
         if not messages or not isinstance(messages[0], SystemMessage):
             messages.insert(0, SystemMessage(content=system))
-        elif summary:
+        elif system != system_prompt:
             messages[0] = SystemMessage(content=system)
         prompt = compressor(messages) if compressor is not None else messages
         response = model.invoke(prompt)
-        return {"messages": [response]}
+        update["messages"] = [response]
+        return update
 
     return agent_node
+
+
+def _system_with_summary(system_prompt: str, summary: str) -> str:
+    """系统提示 + 更早历史的摘要（通用 Agent 与 finalize 节点共用）。"""
+    block = summary_block(summary)
+    return f"{system_prompt}\n\n{block}" if block else system_prompt
+
+
+def summary_block(summary: str) -> str:
+    """「更早对话摘要」段落；没有摘要时返回空串。"""
+    text = summary.strip()
+    if not text:
+        return ""
+    return (
+        f"【更早对话摘要（已压缩）】\n{text}\n\n"
+        "把这段摘要当作已确立的背景继续工作，不要重复确认或复述它。"
+    )
 
 
 def _compress_prompt(

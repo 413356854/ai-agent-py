@@ -11,7 +11,8 @@ from typing import Any
 
 from fastapi.testclient import TestClient
 from langchain_core.documents import Document
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langgraph.errors import GraphRecursionError
 
 import ai_agent_py.api.general_agent as api_general
 from ai_agent_py.api.app import app as fastapi_app
@@ -19,6 +20,7 @@ from ai_agent_py.config import Settings
 from ai_agent_py.db.agent_chat import ChatMessage, InMemoryChatMemoryStore
 from ai_agent_py.errors import ConfigurationError, DatabaseError
 from ai_agent_py.general.agent import build_general_agent_graph, build_general_tools
+from ai_agent_py.graph.nodes import NO_FINAL_ANSWER
 from fakes import ScriptedChatModel, StreamingScriptedChatModel
 
 EXPECTED_TOOLS = [
@@ -698,3 +700,153 @@ def test_chat_retries_once_after_context_overflow(monkeypatch, tmp_path: Path) -
         "user",
         "assistant",
     ]
+
+
+# ---- A-02 循环预算 / finalize --------------------------------------------
+class ToolOnlyGraph:
+    """只返回工具消息、没有最终 AI 回答的假图（D-03 / A-02 的回退场景）。"""
+
+    def invoke(self, state: dict[str, Any], config: Any = None) -> dict[str, Any]:
+        return {
+            "messages": [
+                HumanMessage(content="读一下"),
+                ToolMessage(content="文件原文：差旅住宿按城市分级。", tool_call_id="c1"),
+            ]
+        }
+
+
+def test_chat_returns_finalize_text_instead_of_the_tool_message(
+    monkeypatch, tmp_path: Path
+) -> None:
+    client, store, _ = make_client(monkeypatch, tmp_path, agent_graph=ToolOnlyGraph())
+
+    response = client.post(
+        "/api/general-agent/chat",
+        json={"message": "读一下", "thread_id": "t-noanswer"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["answer"] == NO_FINAL_ANSWER
+    # 落库的是明确的 finalize 文案，不是 ToolMessage 的原文。
+    messages = store.load_messages("t-noanswer")
+    assert messages[-1].role == "assistant"
+    assert messages[-1].content == NO_FINAL_ANSWER
+
+
+def test_chat_reports_finalize_answer_and_exhausted_budget(monkeypatch, tmp_path: Path) -> None:
+    model = ScriptedChatModel(
+        responses=[
+            tool_call_message("search_knowledge_base", {"query": "住宿费"}),
+            AIMessage(content="基于已有资料：一线城市住宿上限 500 元（信息可能不完整）。"),
+        ]
+    )
+    settings = make_settings(tmp_path, agent_max_turns=1)
+    client, store, _ = make_client(monkeypatch, tmp_path, model=model, settings=settings)
+
+    response = client.post(
+        "/api/general-agent/chat",
+        json={"message": "住宿费标准？", "thread_id": "t-budget"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["answer"].startswith("基于已有资料")
+    assert body["budget"]["exhausted"] is True
+    assert body["budget"]["reason"] == "max_steps"
+    assert body["budget"]["max_steps"] == 1
+    # 预算=1：第一次模型调用请求工具后就直接 finalize，工具没有执行。
+    assert body["tool_calls"] == 0
+    assert store.load_messages("t-budget")[-1].role == "assistant"
+
+
+def test_chat_survives_graph_recursion_error(monkeypatch, tmp_path: Path) -> None:
+    class RecursionGraph:
+        def invoke(self, state: dict[str, Any], config: Any = None) -> dict[str, Any]:
+            raise GraphRecursionError("Recursion limit of 3 reached")
+
+    client, store, _ = make_client(monkeypatch, tmp_path, agent_graph=RecursionGraph())
+
+    response = client.post(
+        "/api/general-agent/chat",
+        json={"message": "长任务", "thread_id": "t-recursion"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["answer"] == NO_FINAL_ANSWER
+    assert body["budget"]["exhausted"] is True
+    assert body["budget"]["reason"] == "recursion_limit"
+    assert store.load_messages("t-recursion")[-1].content == NO_FINAL_ANSWER
+
+
+def test_chat_stream_emits_finalize_tokens_and_budget(monkeypatch, tmp_path: Path) -> None:
+    model = StreamingScriptedChatModel(
+        responses=[
+            tool_call_message("search_knowledge_base", {"query": "住宿费"}),
+            AIMessage(content="收尾答案：信息可能不完整。"),
+        ],
+        chunk_size=4,
+    )
+    settings = make_settings(tmp_path, agent_max_turns=1)
+    client, store, _ = make_client(monkeypatch, tmp_path, model=model, settings=settings)
+
+    response = client.post(
+        "/api/general-agent/chat/stream",
+        json={"message": "住宿费标准？", "thread_id": "t-sbudget"},
+    )
+
+    assert response.status_code == 200
+    events = parse_sse(response.text)
+    names = [name for name, _ in events]
+    assert names[-1] == "done"
+    stage = next(payload for name, payload in events if name == "stage")
+    assert stage["stage"] == "finalize"
+    tokens = "".join(payload["text"] for name, payload in events if name == "token")
+    assert tokens == "收尾答案：信息可能不完整。"
+    done = events[-1][1]
+    assert done["answer"] == "收尾答案：信息可能不完整。"
+    assert done["budget"]["exhausted"] is True
+    assert done["budget"]["reason"] == "max_steps"
+    assert done["budget"]["steps"] == 2
+    assert [message.role for message in store.load_messages("t-sbudget")] == [
+        "user",
+        "assistant",
+    ]
+
+
+def test_chat_stream_survives_graph_recursion_error(monkeypatch, tmp_path: Path) -> None:
+    class RecursionStreamGraph:
+        def stream(self, state: dict[str, Any], config: Any, stream_mode: Any = None) -> Any:
+            raise GraphRecursionError("Recursion limit of 3 reached")
+
+    client, store, _ = make_client(monkeypatch, tmp_path, agent_graph=RecursionStreamGraph())
+
+    response = client.post(
+        "/api/general-agent/chat/stream",
+        json={"message": "长任务", "thread_id": "t-srecursion"},
+    )
+
+    assert response.status_code == 200
+    events = parse_sse(response.text)
+    assert [name for name, _ in events][-1] == "done"
+    done = events[-1][1]
+    assert done["answer"] == NO_FINAL_ANSWER
+    assert done["budget"]["exhausted"] is True
+    assert done["budget"]["reason"] == "recursion_limit"
+    assert store.load_messages("t-srecursion")[-1].content == NO_FINAL_ANSWER
+
+
+def test_overview_exposes_loop_budget(monkeypatch, tmp_path: Path) -> None:
+    client, _, _ = make_client(monkeypatch, tmp_path)
+
+    body = client.get("/api/general-agent/overview").json()
+
+    assert body["budget"] == {
+        "max_steps": 4,
+        "max_tool_calls": 24,
+        "max_tokens": 0,
+        "max_seconds": 600.0,
+    }
+    knowledge = body["tools"][0]
+    assert knowledge["dedupe"] is True

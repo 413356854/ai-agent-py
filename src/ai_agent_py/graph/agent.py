@@ -1,8 +1,17 @@
 """The LangGraph agent: a ReAct style loop over the retrieval tool.
 
-    START -> agent --(tool calls?)--> tools -> agent -> ... -> END
+    START -> agent --(tool calls and budget left?)--> tools -> agent -> ...
+              |                    |
+              |                    +--(budget exhausted)--> finalize -> END
+              +--(no tool calls)---------------------------> END
 
-`agent_max_turns` caps the loop through the graph's `recursion_limit`.
+The loop is bounded twice (A-02):
+
+* the **budget** (:mod:`ai_agent_py.graph.budget`) is the normal stop — once the
+  step / tool-call / token / time budget is used up, the graph runs ``finalize``,
+  which answers from the material already collected;
+* the graph's ``recursion_limit`` is only a safety net; :func:`agent_config`
+  derives it from the budget so the budget always wins.
 """
 
 from __future__ import annotations
@@ -12,13 +21,22 @@ from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any, cast
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AnyMessage, HumanMessage
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool
+from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, START, StateGraph
 
 from ai_agent_py.config import Settings, get_settings
-from ai_agent_py.graph.nodes import build_agent_node, build_tool_node, route_after_agent
+from ai_agent_py.graph.budget import LoopBudget, turn_messages
+from ai_agent_py.graph.messages import message_text
+from ai_agent_py.graph.nodes import (
+    NO_FINAL_ANSWER,
+    build_agent_node,
+    build_finalize_node,
+    build_route_after_agent,
+    build_tool_node,
+)
 from ai_agent_py.graph.state import AgentState
 from ai_agent_py.llm import get_chat_model
 from ai_agent_py.rag.milvus_search import DocumentSearcher, get_milvus_searcher
@@ -72,6 +90,7 @@ def build_agent_graph(
     """
     cfg = settings or get_settings()
     model = llm or get_chat_model(cfg)
+    budget = LoopBudget.from_settings(cfg)
     tool_list: list[BaseTool] = (
         list(tools)
         if tools is not None
@@ -80,37 +99,48 @@ def build_agent_graph(
 
     builder = StateGraph(AgentState)
     _add_node(builder, "agent", build_agent_node(model, tool_list, system_prompt=system_prompt))
-    _add_node(builder, "tools", build_tool_node(tool_list, settings=cfg))
+    _add_node(
+        builder,
+        "tools",
+        build_tool_node(tool_list, settings=cfg, budget=budget),
+    )
+    _add_node(
+        builder,
+        "finalize",
+        build_finalize_node(model, system_prompt=system_prompt, budget=budget),
+    )
     builder.add_edge(START, "agent")
-    builder.add_conditional_edges("agent", route_after_agent, {"tools": "tools", "end": END})
+    builder.add_conditional_edges(
+        "agent",
+        build_route_after_agent(budget),
+        {"tools": "tools", "finalize": "finalize", "end": END},
+    )
     builder.add_edge("tools", "agent")
+    builder.add_edge("finalize", END)
 
     return builder.compile(checkpointer=checkpointer)
 
 
-def agent_config(*, thread_id: str | None = None, max_turns: int | None = None) -> RunnableConfig:
-    """Runnable config for one agent invocation (thread + recursion limit)."""
-    cfg = get_settings()
+def agent_config(
+    *,
+    thread_id: str | None = None,
+    max_turns: int | None = None,
+    settings: Settings | None = None,
+) -> RunnableConfig:
+    """Runnable config for one agent invocation (thread + recursion limit).
+
+    ``recursion_limit`` 只是兜底：正常路径由循环预算在 ``finalize`` 收尾，这里保证
+    预算耗尽前不会先撞上 LangGraph 的上限（两者取较大值）。
+    """
+    cfg = settings or get_settings()
+    budget = LoopBudget.from_settings(cfg)
     turns = max_turns or cfg.agent_max_turns
-    config: dict[str, Any] = {"recursion_limit": max(2, turns * 2 + 1)}
+    config: dict[str, Any] = {
+        "recursion_limit": max(2, turns * 2 + 2, budget.recursion_limit()),
+    }
     if thread_id is not None:
         config["configurable"] = {"thread_id": thread_id}
     return cast("RunnableConfig", config)
-
-
-def message_text(message: AnyMessage) -> str:
-    """Flatten message content (string or content-block list) to plain text."""
-    content = message.content
-    if isinstance(content, str):
-        return content
-    parts: list[str] = []
-    if isinstance(content, list):
-        for block in content:
-            if isinstance(block, str):
-                parts.append(block)
-            elif isinstance(block, dict) and block.get("type") == "text":
-                parts.append(str(block.get("text", "")))
-    return "".join(parts)
 
 
 def ask_agent(
@@ -119,14 +149,26 @@ def ask_agent(
     *,
     thread_id: str | None = None,
     max_turns: int | None = None,
+    settings: Settings | None = None,
 ) -> str:
-    """One turn against the agent graph; returns the final answer text."""
-    result = graph.invoke(
-        {"messages": [HumanMessage(content=question)]},
-        agent_config(thread_id=thread_id, max_turns=max_turns),
-    )
+    """One turn against the agent graph; returns the final answer text.
+
+    只看**本轮**（最后一条 `HumanMessage` 之后）的 AI 消息：上一轮的回答不能被当成本轮
+    答案；本轮没有最终回答时返回明确的 finalize 文案，而不是把 `ToolMessage` 当答案。
+    """
+    try:
+        result = graph.invoke(
+            {"messages": [HumanMessage(content=question)]},
+            agent_config(thread_id=thread_id, max_turns=max_turns, settings=settings),
+        )
+    except GraphRecursionError:
+        logger.warning("智能体达到 recursion_limit，返回明确的收尾文案")
+        return NO_FINAL_ANSWER
+
     messages: list[AnyMessage] = result["messages"]
-    for message in reversed(messages):
-        if message.type == "ai" and not getattr(message, "tool_calls", None):
-            return message_text(message)
-    return message_text(messages[-1])
+    for message in reversed(turn_messages(messages)):
+        if isinstance(message, AIMessage) and not getattr(message, "tool_calls", None):
+            text = message_text(message).strip()
+            if text:
+                return text
+    return NO_FINAL_ANSWER

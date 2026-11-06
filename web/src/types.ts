@@ -450,6 +450,8 @@ export interface GeneralAgentTool {
   risk_level?: string
   /** 同一轮是否与其他工具并行执行。 */
   concurrent?: boolean
+  /** 同一轮里重复的相同调用是否直接跳过（只读检索类工具开启）。 */
+  dedupe?: boolean
 }
 
 /** MySQL 会话记忆状态（表是否可读写、历史窗口、会话数）。 */
@@ -480,6 +482,18 @@ export interface GeneralAgentContextConfig {
   overflow_retries: number
 }
 
+/** 概览页展示的循环预算配置（A-02）。 */
+export interface GeneralAgentBudgetConfig {
+  /** 单轮最多模型调用次数（AGENT_MAX_TURNS）。 */
+  max_steps: number
+  /** 单轮最多真正执行的工具调用次数。 */
+  max_tool_calls: number
+  /** 单轮 token 预算；0 = 不限制。 */
+  max_tokens: number
+  /** 单轮墙钟预算（秒）；0 = 不限制。 */
+  max_seconds: number
+}
+
 export interface GeneralAgentOverview {
   ready: boolean
   llm_model: string
@@ -490,6 +504,7 @@ export interface GeneralAgentOverview {
   tools: GeneralAgentTool[]
   memory: GeneralAgentMemory
   context: GeneralAgentContextConfig
+  budget: GeneralAgentBudgetConfig
   warnings: string[]
 }
 
@@ -505,6 +520,22 @@ export interface AgentContextStats {
   compressed_messages: number
   summarized_messages: number
   summary_error: string | null
+}
+
+/** 一轮对话实际用掉的循环预算（A-02）；`exhausted=true` 时答案由 finalize 收尾。 */
+export interface AgentBudgetStats {
+  steps: number
+  tool_calls: number
+  skipped_calls: number
+  tokens: number
+  elapsed_seconds: number
+  max_steps: number
+  max_tool_calls: number
+  max_tokens: number
+  max_seconds: number
+  exhausted: boolean
+  /** max_steps / max_tool_calls / max_tokens / max_seconds / recursion_limit。 */
+  reason: string | null
 }
 
 /** 已压缩历史的摘要。 */
@@ -558,6 +589,7 @@ export interface AgentChatResponse {
   tool_calls: number
   elapsed_ms: number
   context: AgentContextStats
+  budget: AgentBudgetStats
   summary: AgentChatSummary | null
   messages: AgentChatMessage[]
 }
@@ -602,6 +634,7 @@ export interface AgentChatStreamHandlers {
     tool_calls: number
     elapsed_ms: number
     context: AgentContextStats
+    budget: AgentBudgetStats
     summary: AgentChatSummary | null
     messages: AgentChatMessage[]
   }) => void

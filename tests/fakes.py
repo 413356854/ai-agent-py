@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
@@ -66,6 +67,8 @@ class ScriptedChatModel(BaseChatModel):
     responses: list[AIMessage]
     calls: int = 0
     received: list[list[BaseMessage]] = Field(default_factory=list)
+    #: 第 N 次调用（从 1 开始）抛错，用于测试 finalize / 错误降级路径。
+    fail_at: int | None = None
 
     @property
     def _llm_type(self) -> str:
@@ -83,6 +86,8 @@ class ScriptedChatModel(BaseChatModel):
     ) -> ChatResult:
         index = min(self.calls, len(self.responses) - 1)
         self.calls += 1
+        if self.fail_at is not None and self.calls == self.fail_at:
+            raise RuntimeError("模拟模型调用失败")
         self.received.append(list(messages))
         return ChatResult(generations=[ChatGeneration(message=self.responses[index])])
 
@@ -90,8 +95,10 @@ class ScriptedChatModel(BaseChatModel):
 class StreamingScriptedChatModel(ScriptedChatModel):
     """`ScriptedChatModel` 的流式版本：把回复按 ``chunk_size`` 逐段吐出。
 
-    用来验证「RAG 问答」的 SSE 逐 token 推送——真实模型（ChatOpenAI streaming=True）
-    走的是同一条 ``_stream`` 路径。
+    用来验证「RAG 问答」与「通用 Agent」的 SSE 逐 token 推送——真实模型
+    （ChatOpenAI streaming=True）走的是同一条 ``_stream`` 路径。带工具调用的
+    回复按 ``tool_call_chunks`` 推送（与 OpenAI 的流式工具调用一致），
+    否则重组出来的 AIMessage 会丢掉 ``tool_calls``。
     """
 
     chunk_size: int = 4
@@ -104,7 +111,29 @@ class StreamingScriptedChatModel(ScriptedChatModel):
         **kwargs: Any,
     ) -> Iterator[ChatGenerationChunk]:
         result = self._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
-        content = result.generations[0].message.content
+        message = result.generations[0].message
+        if message.tool_calls:
+            chunk = ChatGenerationChunk(
+                message=AIMessageChunk(
+                    content="",
+                    tool_call_chunks=[
+                        {
+                            "name": str(call.get("name") or ""),
+                            "args": json.dumps(call.get("args") or {}, ensure_ascii=False),
+                            "id": str(call.get("id") or ""),
+                            "index": index,
+                            "type": "tool_call_chunk",
+                        }
+                        for index, call in enumerate(message.tool_calls)
+                    ],
+                )
+            )
+            if run_manager is not None:
+                run_manager.on_llm_new_token("", chunk=chunk)
+            yield chunk
+            return
+
+        content = message.content
         text = content if isinstance(content, str) else ""
         size = max(1, self.chunk_size)
         pieces = [text[start : start + size] for start in range(0, len(text), size)] or [""]

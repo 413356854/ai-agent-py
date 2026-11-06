@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS `tb_agent_chat_message` (
   `tool_args` MEDIUMTEXT NULL
     COMMENT '工具入参 JSON（role=tool 时有值）',
   `tool_status` VARCHAR(16) NULL
-    COMMENT '工具执行结果：ok / error / timeout / invalid_args',
+    COMMENT '工具执行结果：ok / error / timeout / invalid_args / skipped（重复调用或超出预算被跳过）',
   `elapsed_ms` INT UNSIGNED NULL
     COMMENT '工具执行耗时（毫秒）；由工具节点写入 artifact.elapsed_ms',
 
