@@ -198,12 +198,26 @@ def create_app() -> FastAPI:
     # ---- 私域 OSS（阿里云私有 Bucket：上传 / 读取 / 列表 / 删除）---------
     app.include_router(oss_router)
 
+    @app.on_event("startup")
+    async def _start_approval_sweeper() -> None:
+        """审批超时巡检：图停在 G8 后没人处理时按超时升级 / 自动拒绝。"""
+        from ai_agent_py.api.agents import start_approval_sweeper
+
+        start_approval_sweeper(app)
+
     @app.on_event("shutdown")
     async def _close_oss() -> None:
         """关停时释放 OSS 的 httpx 连接池（首次请求才创建，可能不存在）。"""
         service = getattr(app.state, "oss", None)
         if service is not None:
             await service.aclose()
+
+    @app.on_event("shutdown")
+    async def _stop_approval_sweeper() -> None:
+        """关停时取消审批巡检（待审批记录留在库里，下次启动继续巡检）。"""
+        from ai_agent_py.api.agents import stop_approval_sweeper
+
+        await stop_approval_sweeper(app)
 
     @app.on_event("shutdown")
     async def _close_documents() -> None:

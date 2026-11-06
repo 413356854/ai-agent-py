@@ -13,9 +13,14 @@ from __future__ import annotations
 import operator
 import re
 import time
+from datetime import UTC, datetime
 from typing import Annotated, Any, TypedDict
 
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import interrupt
+
+from ai_agent_py.runs.models import ApprovalRequest
 
 from .rules import (
     Finding,
@@ -40,7 +45,11 @@ NODE_META: dict[str, dict[str, str]] = {
 
 
 class ClaimState(TypedDict, total=False):
-    """图状态：``findings`` / ``trace`` 用 reducer 追加归并，其余键由节点覆盖。"""
+    """图状态：``findings`` / ``trace`` 用 reducer 追加归并，其余键由节点覆盖。
+
+    ``approval`` 是人工审批记录（谁、什么时候、同意还是拒绝），只在 HITL 运行里出现，
+    单次试跑时为「待人工」占位。
+    """
 
     claim: dict[str, Any]
     context: dict[str, Any]
@@ -48,6 +57,7 @@ class ClaimState(TypedDict, total=False):
     confidence: float
     findings: Annotated[list[dict[str, Any]], operator.add]
     decision: dict[str, Any]
+    approval: dict[str, Any]
     trace: Annotated[list[dict[str, Any]], operator.add]
     status: str
 
@@ -214,16 +224,114 @@ def node_conclude(state: ClaimState) -> dict[str, Any]:
     return {"status": status, "trace": [_event("conclude", started, f"输出结论：{status}")]}
 
 
-def node_human_review(state: ClaimState) -> dict[str, Any]:
+def _approval_request(state: ClaimState) -> ApprovalRequest:
+    """把「为什么要人看」整理成审批请求（业务审批与工具审批共用同一结构）。
+
+    请求里带单据号、金额、命中规则与风险等级，审批页不用再回查解析结果就能判断值不值得批。
+    """
+    decision = state.get("decision") or {}
+    normalized = state.get("normalized") or {}
+    findings = state.get("findings") or []
+    claim_id = str(normalized.get("claim_id") or "")
+    employee = (normalized.get("employee") or {}).get("name", "")
+    risky = [item for item in findings if item.get("severity") in ("高", "中")]
+    return ApprovalRequest(
+        type="approval",
+        agent_id="reimburse",
+        node="human_review",
+        title=f"报销单 {claim_id or '未编号'} 需要人工复核",
+        summary=str(decision.get("reason") or ""),
+        risk="high" if risky else "medium",
+        args={
+            "claim_id": claim_id,
+            "employee": employee,
+            "category": normalized.get("category", ""),
+            "total": normalized.get("total", ""),
+        },
+        claim_id=claim_id or None,
+        details={
+            "confidence": state.get("confidence"),
+            "decision": decision.get("status", ""),
+            "findings": [
+                {
+                    "rule_id": item.get("rule_id", ""),
+                    "severity": item.get("severity", ""),
+                    "message": item.get("message", ""),
+                }
+                for item in findings
+            ],
+        },
+    )
+
+
+def _hitl_enabled(config: RunnableConfig | None) -> bool:
+    """本次运行是否真的暂停等人：只有运行服务会带上 ``hitl`` 标记。
+
+    单次试跑（``run_claim`` / 接口 ``/run``）没有检查点，也无人可等，于是保持原来的
+    「生成待办」语义——图照样能画出 G8，但不在这里挂住。
+    """
+    configurable = (config or {}).get("configurable") or {}
+    return bool(configurable.get("hitl"))
+
+
+def _approval_record(resumed: Any, request: ApprovalRequest) -> dict[str, Any]:
+    """``interrupt()`` 的恢复值 → 审批记录（字段缺失一律按拒绝处理，失败关闭）。"""
+    raw = resumed if isinstance(resumed, dict) else {}
+    decision = str(raw.get("decision") or "reject").strip().lower()
+    if decision not in {"approve", "reject"}:
+        decision = "reject"
+    return {
+        "decision": decision,
+        "approved": decision == "approve",
+        "approver": str(raw.get("approver") or "审批人"),
+        "comment": str(raw.get("comment") or ""),
+        "timeout": bool(raw.get("timeout")),
+        "at": str(raw.get("at") or datetime.now(UTC).isoformat()),
+        "request": request.as_dict(),
+    }
+
+
+def node_human_review(state: ClaimState, config: RunnableConfig) -> dict[str, Any]:
     """G8 人工复核：低置信或语义疑点生成人工待办，不做自动退回。
 
     业务约定：语义类疑点只能由人确认业务实质，机器只提示、不裁决。
+
+    带 ``hitl`` 配置时这里会**真的暂停**（``interrupt``）：单据状态写进检查点，进程重启
+    也能恢复；审批接口用 ``Command(resume=...)`` 把结论送回来，节点从 ``interrupt()`` 的
+    返回值继续——同意改「通过」、拒绝改「退回」，随后照常进入归档。不带 ``hitl``（单次
+    试跑）时保持原行为，只产出「转人工」待办。
     """
     started = time.perf_counter()
     decision = state.get("decision") or {}
+    request = _approval_request(state)
+    if not _hitl_enabled(config):
+        return {
+            "status": "转人工",
+            "approval": {
+                "decision": "pending",
+                "approved": False,
+                "approver": "",
+                "comment": "",
+                "timeout": False,
+                "at": datetime.now(UTC).isoformat(),
+                "request": request.as_dict(),
+            },
+            "trace": [_event("human_review", started, f"生成待办：{decision.get('reason', '')}")],
+        }
+
+    approval = _approval_record(interrupt(request.as_dict()), request)
+    approved = bool(approval["approved"])
+    status = "通过" if approved else "退回"
+    reason = (
+        f"人工复核通过（{approval['approver']}）：{decision.get('reason', '')}"
+        if approved
+        else f"人工复核退回（{approval['approver']}）：{approval['comment'] or decision.get('reason', '')}"
+    )
     return {
-        "status": "转人工",
-        "trace": [_event("human_review", started, f"生成待办：{decision.get('reason', '')}")],
+        "status": status,
+        "approval": approval,
+        "decision": {**decision, "status": status, "reason": reason, "human": True},
+        "trace": [_event("human_review", started, reason)],
     }
 
 
@@ -245,8 +353,12 @@ def route_after_decide(state: ClaimState) -> str:
 # --------------------------------------------------------------------------- 装配
 
 
-def build_graph():
-    """构建并编译报销审核图（无 checkpointer，便于导出与单次试跑）。"""
+def build_graph(*, checkpointer: Any | None = None):
+    """构建并编译报销审核图。
+
+    ``checkpointer`` 只在 HITL 运行（运行服务）时传入：图停在 ``human_review`` 后状态写进
+    检查点，等审批接口恢复；单次试跑与图导出不传，保持无状态、可重复执行。
+    """
     builder = StateGraph(ClaimState)
     builder.add_node("ingest", node_ingest)
     builder.add_node("extract", node_extract)
@@ -272,28 +384,34 @@ def build_graph():
     builder.add_edge("conclude", "archive")
     builder.add_edge("human_review", "archive")
     builder.add_edge("archive", END)
-    return builder.compile()
+    return builder.compile(checkpointer=checkpointer)
 
 
-def run_claim(claim: dict[str, Any], *, history: list[str] | None = None) -> dict[str, Any]:
-    """跑一单：装配上下文、执行整张图，返回结论 / Finding / 节点轨迹。
+#: Finding 的展示顺序：阻断 → 高 → 中 → 警告 → 提示。
+SEVERITY_ORDER: dict[str, int] = {"阻断": 0, "高": 1, "中": 2, "警告": 3, "提示": 4}
 
-    ``history`` 是已报销过的发票号（默认用样例里的演示数据），用于重复报销判定；
-    Finding 按"阻断 → 高 → 中 → 警告 → 提示"排序，前端直接按序展示。
+
+def build_context(claim: dict[str, Any], *, history: list[str] | None = None) -> dict[str, Any]:
+    """装配一次审核的运行上下文：企业主体、历史发票、报销期间与起止日。
+
+    ``history`` 是已报销过的发票号（默认用样例里的演示数据），用于重复报销判定。
     """
-    started = time.perf_counter()
-    context = {
+    return {
         "company": COMPANY,
         "history": sorted(history if history is not None else HISTORY),
         "period": claim.get("period", ""),
         "period_range": period_bounds(claim.get("period", "")),
     }
-    graph = build_graph()
-    result = graph.invoke({"claim": claim, "context": context, "findings": [], "trace": []})
 
+
+def build_result(result: dict[str, Any], elapsed_ms: float = 0.0) -> dict[str, Any]:
+    """图最终状态 → 对外结果（结论 / Finding / 轨迹 / 人工审批记录）。"""
     findings = sorted(
         result.get("findings") or [],
-        key=lambda item: ({"阻断": 0, "高": 1, "中": 2, "警告": 3, "提示": 4}.get(item.get("severity"), 9), item.get("rule_id", "")),
+        key=lambda item: (
+            SEVERITY_ORDER.get(item.get("severity"), 9),
+            item.get("rule_id", ""),
+        ),
     )
     return {
         "claim_id": (result.get("normalized") or {}).get("claim_id", ""),
@@ -302,8 +420,28 @@ def run_claim(claim: dict[str, Any], *, history: list[str] | None = None) -> dic
         "confidence": result.get("confidence", 0.0),
         "findings": findings,
         "trace": result.get("trace") or [],
-        "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
+        "approval": result.get("approval") or None,
+        "elapsed_ms": round(elapsed_ms, 2),
     }
+
+
+def run_claim(claim: dict[str, Any], *, history: list[str] | None = None) -> dict[str, Any]:
+    """跑一单（单次试跑，不在 G8 暂停）：返回结论 / Finding / 节点轨迹。
+
+    需要人工审批 / 暂停恢复时走运行服务（``RunService`` + 带 checkpointer 的图），
+    这里保持「一口气跑完」的预览语义。
+    """
+    started = time.perf_counter()
+    graph = build_graph()
+    result = graph.invoke(
+        {
+            "claim": claim,
+            "context": build_context(claim, history=history),
+            "findings": [],
+            "trace": [],
+        }
+    )
+    return build_result(result, (time.perf_counter() - started) * 1000)
 
 
 # --------------------------------------------------------------------------- 图导出

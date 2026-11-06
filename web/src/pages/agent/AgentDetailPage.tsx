@@ -30,6 +30,7 @@ import {
 import type { TableProps } from 'antd'
 import { useParams } from 'react-router-dom'
 import { ApiError, api } from '../../api/client'
+import { ApprovalPanel } from '../../components/ApprovalPanel'
 import { ClaimDataCard } from '../../components/ClaimDataCard'
 import { ParamEditor } from '../../components/ParamEditor'
 import type {
@@ -660,6 +661,11 @@ export function AgentDetailPage() {
                 )}
               </Space>
             ),
+          },
+          {
+            key: 'approval',
+            label: '人工审批',
+            children: <ApprovalPanel agentId={agentId} samples={samples} />,
           },
           {
             key: 'rules',

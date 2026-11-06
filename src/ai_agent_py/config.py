@@ -67,6 +67,14 @@ class Settings(BaseSettings):
     # 单轮墙钟预算（秒）；0 = 不限制。只在 agent 节点返回后检查，不会中断正在跑的工具。
     agent_max_seconds: float = 600.0
 
+    # ---- 人工审批（HITL，runs/service.py）--------------------------------
+    # 图停在审批节点后最多等多久（秒）；0 = 不限时（一直等人，适合演示）。
+    agent_approval_timeout: float = 1800.0
+    # 到期仍未审批时先「升级」并延长多久（秒）；0 = 到点直接自动拒绝。
+    agent_approval_escalate_seconds: float = 600.0
+    # 审批暂停时的 LangGraph 检查点文件（SQLite）；重启后仍可恢复。
+    agent_run_checkpoint_path: Path = PROJECT_ROOT / "data" / "agent_runs.sqlite3"
+
     # ---- 通用 agent 工具（read / write / edit / glob / grep / shell）----
     # 文件工具只能读写这个目录内的路径，shell 的 cwd 也限制在这里。
     agent_workspace: Path = PROJECT_ROOT
@@ -476,6 +484,11 @@ class Settings(BaseSettings):
                 f"mysql, candidates={self.agent_memory_candidates}, "
                 f"sessions={self.agent_memory_sessions}"
             ),
+            "agent_approval": (
+                f"timeout={self.agent_approval_timeout:g}s, "
+                f"escalate={self.agent_approval_escalate_seconds:g}s, "
+                f"checkpoint={self.agent_run_checkpoint_path}"
+            ),
             "agent_context": (
                 f"model={self.agent_model_context_tokens}, "
                 f"budget={self.agent_context_max_tokens or 'auto'}, "
@@ -559,6 +572,7 @@ class Settings(BaseSettings):
         "mineru_output_dir",
         "rag_delete_pending_dir",
         "agent_workspace",
+        "agent_run_checkpoint_path",
         mode="after",
     )
     @classmethod
@@ -760,6 +774,13 @@ class Settings(BaseSettings):
     def _positive_agent_memory(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("AGENT_MEMORY_SESSIONS 必须是正整数")
+        return value
+
+    @field_validator("agent_approval_timeout", "agent_approval_escalate_seconds", mode="after")
+    @classmethod
+    def _non_negative_approval_timeout(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError("AGENT_APPROVAL_TIMEOUT / AGENT_APPROVAL_ESCALATE_SECONDS 不能为负数")
         return value
 
     @field_validator(

@@ -74,6 +74,9 @@
   判定器注册表）。后台「Agent 应用」栏目直接展示 **`get_graph().draw_mermaid()` 导出的流程图**，
   可切换主题、查看原始 Mermaid 源码；试跑页支持**下载填充好的 xlsx 样板 / 空白模板**，
   也可以**直接上传填好的单据（xlsx / json）**解析后试跑；语义疑点只会转人工，不会自动退回。
+  **人工审批（HITL）**：「试跑」是一口气跑完的预览；「人工审批」页提交的正式运行会**真的停在 G8**
+  （LangGraph `interrupt` + SQLite 检查点，重启后仍可恢复），审批通过继续归档、拒绝则退回；
+  超时未处理先升级再自动拒绝，运行记录落 MySQL `tb_agent_run`，审批流与破坏性工具审批共用同一套状态机。
 - **通用 Agent（全部工具 + MySQL 会话记忆）**：后台「Agent 应用 → 通用 Agent」是一张
   LangChain / LangGraph 的 `agent ⇄ tools` 图，**一次接入全部工具**：知识库检索
   （`search_knowledge_base`）、文件读写（`read` / `write` / `edit` / `glob` / `grep`）、
@@ -109,7 +112,8 @@ ai-agent-py/
 ├── data/
 │   ├── raw/                  # 待索引文档（内置 sample.md）
 │   ├── parsed/               # MinerU 解析结果（Markdown + 图片；任务记录在 MySQL）
-│   └── rag_delete_pending/   # RAG 切片补删队列（删除文档时 Milvus 不可用的兜底）
+│   ├── rag_delete_pending/   # RAG 切片补删队列（删除文档时 Milvus 不可用的兜底）
+│   └── agent_runs.sqlite3    # HITL 检查点（图停在审批点后的完整状态，重启可恢复）
 ├── src/ai_agent_py/
 │   ├── config.py             # pydantic-settings：全部配置项 + 脱敏描述
 │   ├── llm.py                # 对话模型 / 向量模型工厂（OpenAI 兼容协议）
@@ -148,6 +152,8 @@ ai-agent-py/
 │   │   ├── state.py          # AgentState（messages + add_messages 归并）
 │   │   ├── nodes.py          # agent 节点、tools 节点、条件路由
 │   │   ├── agent.py          # 组装并编译 StateGraph
+│   │   ├── budget.py         # 循环预算：步数 / 工具次数 / token / 墙钟
+│   │   ├── checkpoint.py     # 单文件 SQLite checkpointer（interrupt/resume 持久化，零新依赖）
 │   │   └── rag_chat.py       # RAG 问答图：condense → retrieve → resolve → answer
 │   ├── tools/
 │   │   ├── __init__.py       # 工具出口：检索工具 + 通用工具构建函数
@@ -160,9 +166,13 @@ ai-agent-py/
 │   │   ├── rules.py          # 13 条规则（YAML 元数据 + 判定器注册表）
 │   │   ├── params.py         # 参数库存储：内存缓存 + 原子落盘 + 失效重载
 │   │   ├── io.py             # 单据模板导出/导入（xlsx 双向 + json）
-│   │   ├── graph.py          # G1–G9 工序图，describe_graph() 导出 mermaid
+│   │   ├── graph.py          # G1–G9 工序图（G8 interrupt），describe_graph() 导出 mermaid
 │   │   ├── samples.py        # 7 张合成样例单据（通过/退回/转人工）
 │   │   └── data/             # rules.yaml + policy_params.yaml（占位参数）
+│   ├── runs/                 # 人工审批（HITL）运行状态机
+│   │   ├── models.py         # RunStatus / ApprovalRequest / RunRecord / 恢复值（审批与工具审批同构）
+│   │   ├── store.py          # tb_agent_run 读写：MySQL + 内存实现（条件更新保证状态流转原子）
+│   │   └── service.py        # 启动 / 审批恢复 / 取消 / 超时升级与自动拒绝
 │   ├── general/              # 通用 Agent：工具装配 / 提示词 / 上下文预算 / 摘要
 │   │   ├── agent.py          # build_general_tools / build_general_agent_graph / 自定义状态节点
 │   │   ├── context.py        # token 估算、历史选择、单条/单轮工具输出修剪
@@ -171,12 +181,12 @@ ai-agent-py/
 │       ├── app.py            # FastAPI：/query /chat /health /info + 前端托管
 │       ├── database.py       # MySQL 健康检查接口：/api/db/health
 │       ├── documents.py      # 文档解析接口：上传 / 状态 / 预览 / 下载 / 切分 / 入库 / 删除
-│       ├── agents.py         # Agent 应用：列表 / 图导出 / 样例 / 试跑
+│       ├── agents.py         # Agent 应用：列表 / 图导出 / 样例 / 试跑 / 人工审批运行
 │       ├── general_agent.py  # 通用 Agent：概览 / MySQL 会话 / 对话（含 SSE 流式）
 │       ├── oss.py            # 私域 OSS：上传 / 列举 / 换取直链 / 删除（access 鉴权）
 │       └── rag.py            # RAG 记录列表 + RAG 问答（含 SSE 流式）
 ├── web/                      # 管理后台（文档解析 / RAG 记录 / RAG 问答 / Agent 应用 / 通用 Agent / 私域 OSS）
-└── tests/                    # pytest：加载、切分、链路、图、API、CLI、MinerU、MySQL、RAG、通用 Agent
+└── tests/                    # pytest：加载、切分、链路、图、API、CLI、MinerU、MySQL、RAG、通用 Agent、HITL
 ```
 
 ## 快速开始
@@ -245,7 +255,12 @@ Invoke-RestMethod -Uri http://127.0.0.1:8000/query -Method Post `
 | GET | `/api/agents/{id}/config` | 规则库与参数（参数默认标 `placeholder`） |
 | PUT | `/api/agents/{id}/config/params` | 覆盖写入参数：校验 → 落盘 → 刷新缓存，立即生效 |
 | POST | `/api/agents/{id}/config/reload` | 手工改了 YAML 后重新读取参数文件 |
-| POST | `/api/agents/{id}/run` | 试跑一单：`{"sample_id": "C001"}` 或 `{"claim": {...}}` |
+| POST | `/api/agents/{id}/run` | 试跑一单（不停顿）：`{"sample_id": "C001"}` 或 `{"claim": {...}}` |
+| POST | `/api/agents/{id}/runs` | 提交正式运行：需要人拍板的单子停在 G8，返回 `status=pending` 与审批内容 |
+| GET | `/api/agents/{id}/runs` | 运行 / 待审批列表（`?status=pending,escalated` 只看待审批） |
+| GET | `/api/agents/{id}/runs/{run_id}` | 运行详情：审批请求、结果、状态流转流水 |
+| POST | `/api/agents/{id}/runs/{run_id}/resume` | 审批并继续：`{"decision": "approve" \| "reject", "approver": ..., "comment": ...}` |
+| POST | `/api/agents/{id}/runs/{run_id}/cancel` | 撤销等待中的运行（检查点一并删除） |
 | GET | `/api/agents/{id}/template` | 空白报销单模板（xlsx） |
 | GET | `/api/agents/{id}/samples/{sid}/download` | 样例样板下载（`fmt=xlsx` 或 `json`） |
 | POST | `/api/agents/{id}/upload` | 上传填好的单据（xlsx/json）→ 解析成 claim |
@@ -456,6 +471,31 @@ curl.exe -N -X POST http://127.0.0.1:8000/api/rag/chat/stream `
 
 - **报销审核**：9 节点工序图 + 13 条规则，可下载 / 上传 xlsx 单据试跑，结果给出「通过 / 退回 / 转人工」与依据；
 - **通用 Agent**：ReAct 图一次接入知识库、文件、命令、联网工具，工具调用与回答通过 SSE 实时展示，会话记忆保存在 MySQL。
+
+### 人工审批（HITL，`runs/` + `graph/checkpoint.py`）
+
+「试跑」（`POST /api/agents/{id}/run`）是一口气跑完的预览：G8 只产出「转人工」待办。
+「人工审批」页提交的**正式运行**（`POST /api/agents/{id}/runs`）会真的停下来：
+
+```text
+POST /runs ──> 跑到 G8 ──interrupt()──> pending（检查点落 data/agent_runs.sqlite3）
+                                   │
+        POST /runs/{id}/resume ────┴──> approve → 继续归档（结论「通过」）
+                                    └──> reject  → 归档（结论「退回」）
+POST /runs/{id}/cancel ──> cancelled（删除检查点）
+超时未处理 ──> escalated（先升级、延长宽限期）──> timeout（自动拒绝，审批人记「系统（超时）」）
+```
+
+- **真的暂停、重启可恢复**：G8 用 LangGraph `interrupt()`，完整状态写进 `graph/checkpoint.py`
+  的单文件 SQLite（零新依赖），审批接口用 `Command(resume=...)` 接着跑——服务重启后仍能审批；
+- **运行状态机**：`running / pending / escalated / approved / rejected / timeout / cancelled /
+  completed / failed`，一条运行一行 `tb_agent_run`（建表脚本 `docs/mysql/tb_agent_run.sql`），
+  状态流转用 `WHERE status IN (...)` 条件更新，两个标签页同时点「通过」只会有一个成功（另一个 409）；
+- **超时治理**：`AGENT_APPROVAL_TIMEOUT`（默认 1800s）+ `AGENT_APPROVAL_ESCALATE_SECONDS`
+  （默认 600s）；除接口读路径会巡检外，应用启动后还有每 30s 一次的后台巡检，
+  没人打开页面也会按时升级 / 自动拒绝；
+- **一套状态机两处复用**：`ApprovalRequest` 只认 `type / risk / tool / args`，报销审批
+  （`type=approval`）与破坏性工具审批（`type=tool_call`）共用运行记录、审批接口与超时策略。
 
 ## 私域 OSS（阿里云 OSS 私有 Bucket）
 
@@ -1109,8 +1149,9 @@ curl.exe -N -X POST http://127.0.0.1:8000/api/general-agent/chat/stream `
 
 ```powershell
 mysql -u admin -p db_py_agent < docs/mysql/tb_document_parse_job.sql
+mysql -u admin -p db_py_agent < docs/mysql/tb_agent_run.sql
 # PowerShell 没有输入重定向时：
-Get-Content docs/mysql/tb_document_parse_job.sql | mysql -u admin -p db_py_agent
+Get-Content docs/mysql/tb_agent_run.sql | mysql -u admin -p db_py_agent
 ```
 
 - 表名 `tb_document_parse_job`，一行一个解析任务；`id` 同时是 `data/parsed/<id>/` 的目录名。
@@ -1147,7 +1188,7 @@ uv run ai-agent-py db import-jobs             # 写入 tb_document_parse_job
 ## 开发
 
 ```powershell
-uv run pytest            # 453 个测试，全部离线（MinerU / 精排用 httpx.MockTransport，任务记录库用内存 JobStore，RAG 记录 / 问答用假 Milvus 客户端与脚本化模型；检索链路用 offline.OfflineChunkSearcher）
+uv run pytest            # 478 个测试，全部离线（MinerU / 精排用 httpx.MockTransport，任务记录库用内存 JobStore，RAG 记录 / 问答用假 Milvus 客户端与脚本化模型；检索链路用 offline.OfflineChunkSearcher）
 uv run ruff check .      # 静态检查
 uv run ruff format .     # 格式化
 uv run mypy              # 类型检查（src 目录）

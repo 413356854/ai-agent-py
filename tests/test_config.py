@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
@@ -123,6 +125,27 @@ def test_agent_tool_settings() -> None:
         Settings(_env_file=None, web_extractor_timeout=0)
     with pytest.raises(ValidationError):
         Settings(_env_file=None, web_extractor_max_chars=0)
+
+
+def test_agent_approval_settings(tmp_path: Path) -> None:
+    """HITL 配置：审批时限、升级宽限期、检查点文件（相对路径按项目根解析）。"""
+    cfg = Settings(_env_file=None)
+    assert cfg.agent_approval_timeout == 1800
+    assert cfg.agent_approval_escalate_seconds == 600
+    assert cfg.agent_run_checkpoint_path.is_absolute()
+    assert "timeout=1800s" in cfg.describe()["agent_approval"]
+    assert "escalate=600s" in cfg.describe()["agent_approval"]
+
+    assert Settings(_env_file=None, agent_approval_timeout=0).agent_approval_timeout == 0
+    override = Settings(
+        _env_file=None, agent_run_checkpoint_path=tmp_path / "runs.sqlite3"
+    )
+    assert override.agent_run_checkpoint_path == tmp_path / "runs.sqlite3"
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, agent_approval_timeout=-1)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, agent_approval_escalate_seconds=-1)
 
 
 def test_agent_loop_budget_settings() -> None:

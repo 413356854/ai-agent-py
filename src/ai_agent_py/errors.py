@@ -39,6 +39,14 @@ class DatabaseError(AiAgentError):
     """MySQL 连接、认证或查询失败。"""
 
 
+class RunNotFound(AiAgentError):
+    """运行 ID 不存在（可能已被清理，或从来没创建过）。"""
+
+
+class RunConflict(AiAgentError):
+    """运行状态不允许当前操作：已审批 / 已取消 / 已超时 / 并发抢占失败。"""
+
+
 class MilvusError(AiAgentError):
     """Milvus 连接、建表、写入或检索失败。"""
 

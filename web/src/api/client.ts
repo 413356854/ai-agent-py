@@ -11,7 +11,9 @@ import type {
   AgentContextStats,
   AgentDetail,
   AgentGraph,
+  AgentRun,
   AgentRunResult,
+  AgentRunStartPayload,
   AgentSample,
   AgentSummary,
   AgentUploadResult,
@@ -220,6 +222,47 @@ export const api = {
       body: form,
     })
   },
+
+  /* ---- 人工审批（HITL）：提交运行 / 审批 / 取消 ----------------------- */
+  /** 运行列表；`status` 可传逗号分隔的多个状态（如 `pending,escalated`）。 */
+  agentRuns: (agentId: string, status?: string) =>
+    request<AgentRun[]>(
+      `/api/agents/${agentId}/runs${status ? `?status=${encodeURIComponent(status)}` : ''}`,
+    ),
+
+  agentRun: (agentId: string, runId: string) =>
+    request<AgentRun>(`/api/agents/${agentId}/runs/${runId}`),
+
+  /** 提交一次正式运行：需要人拍板的单子会停在 G8，返回 `status=pending`。 */
+  startAgentRun: (agentId: string, payload: AgentRunStartPayload) =>
+    request<AgentRun>(`/api/agents/${agentId}/runs`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }),
+
+  /** 审批：`approve` 继续归档，`reject` 退回；重复提交返回 409。 */
+  resumeAgentRun: (
+    agentId: string,
+    runId: string,
+    payload: { decision: 'approve' | 'reject'; approver?: string; comment?: string },
+  ) =>
+    request<AgentRun>(`/api/agents/${agentId}/runs/${runId}/resume`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }),
+
+  cancelAgentRun: (
+    agentId: string,
+    runId: string,
+    payload: { approver?: string; comment?: string } = {},
+  ) =>
+    request<AgentRun>(`/api/agents/${agentId}/runs/${runId}/cancel`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }),
 
   /** 空白模板 xlsx 下载地址。 */
   agentTemplateUrl: (agentId: string) => `${API_BASE}/api/agents/${agentId}/template`,

@@ -401,6 +401,78 @@ export interface AgentRunResult {
   findings: AgentFinding[]
   trace: AgentTraceEvent[]
   elapsed_ms: number
+  /** HITL 运行才有的审批记录（单次试跑为待人工占位）。 */
+  approval?: AgentApprovalRecord | null
+}
+
+/* ---- 人工审批（HITL）---------------------------------------------------- */
+
+/** 审批请求（`interrupt()` 的 payload）：业务审批与工具审批同构。 */
+export interface AgentApprovalRequest {
+  type: string
+  agent_id: string
+  node: string
+  title: string
+  summary: string
+  /** low / medium / high */
+  risk: string
+  tool: string | null
+  args: Record<string, unknown>
+  claim_id: string | null
+  details: {
+    confidence?: number
+    decision?: string
+    findings?: { rule_id: string; severity: string; message: string }[]
+    [key: string]: unknown
+  }
+}
+
+/** 已作出（或待作出）的审批结论。 */
+export interface AgentApprovalRecord {
+  decision: string
+  approved: boolean
+  approver: string
+  comment: string
+  timeout: boolean
+  at: string
+  request: AgentApprovalRequest
+}
+
+/** 运行状态流转的一条记录。 */
+export interface AgentRunEvent {
+  at: string
+  status: string
+  by: string | null
+  note: string
+}
+
+/** `GET /api/agents/{id}/runs` 的一条运行（`tb_agent_run`）。 */
+export interface AgentRun {
+  run_id: string
+  agent_id: string
+  thread_id: string
+  /** running / pending / escalated / approved / rejected / timeout / cancelled / completed / failed */
+  status: string
+  title: string
+  created_at: string
+  updated_at: string
+  expires_at: string | null
+  finished_at: string | null
+  approver: string | null
+  comment: string | null
+  error: string | null
+  approval: AgentApprovalRequest | null
+  result: AgentRunResult | null
+  events: AgentRunEvent[]
+}
+
+/** `POST /api/agents/{id}/runs` 的请求体。 */
+export interface AgentRunStartPayload {
+  sample_id?: string
+  claim?: Record<string, unknown>
+  /** 本次审批时限（秒）；0 = 一直等人。 */
+  timeout_seconds?: number
+  created_by?: string
 }
 
 export interface AgentRule {

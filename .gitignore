@@ -22,6 +22,8 @@ htmlcov/
 # ---- data -----------------------------------------------------------------
 data/parsed/
 data/rag_delete_pending/
+data/agent_runs.sqlite3
+data/agent_runs.sqlite3-*
 data/raw/*
 !data/raw/.gitkeep
 !data/raw/sample.md
