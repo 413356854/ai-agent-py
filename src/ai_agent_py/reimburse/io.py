@@ -13,7 +13,6 @@ from typing import Any
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.utils import get_column_letter
 
 SHEET_INFO = "单据信息"
 SHEET_INVOICES = "发票明细"
@@ -233,7 +232,7 @@ def _parse_info(rows: list[tuple[Any, Any]]) -> dict[str, Any]:
 
     以"显示名 → 字段路径"映射为准，不依赖行的先后顺序；解析不了的值进 warnings。
     """
-    labels = {label: path for label, path in INFO_FIELDS}
+    labels = dict(INFO_FIELDS)
     claim: dict[str, Any] = {"employee": {}, "meta": {}, "approvals": [], "attachments": []}
     warnings: list[str] = []
     for label, value in rows:
@@ -282,10 +281,10 @@ def _parse_invoices(ws) -> list[dict[str, Any]]:
         if not any(cell not in (None, "") for cell in row):
             continue
 
-        def pick(name: str) -> Any:
+        def pick(name: str, cells: tuple[Any, ...] = row) -> Any:
             """按表头名取值，缺列返回 None，列顺序调整后仍能对上。"""
             position = index.get(name)
-            return row[position] if position is not None and position < len(row) else None
+            return cells[position] if position is not None and position < len(cells) else None
 
         items = []
         for chunk in filter(None, (part.strip() for part in _as_text(pick("明细")).replace("，", "、").split("、"))):
@@ -330,7 +329,7 @@ def parse_upload(filename: str, content: bytes) -> tuple[dict[str, Any], list[st
     elif suffix in ("xlsx", "xlsm"):
         try:
             book = load_workbook(io.BytesIO(content), data_only=True)
-        except Exception as exc:  # noqa: BLE001 - openpyxl 抛出的异常类型很杂
+        except Exception as exc:  # openpyxl 抛出的异常类型很杂
             raise ValueError(f"Excel 解析失败：{exc}") from exc
         if SHEET_INFO not in book.sheetnames or SHEET_INVOICES not in book.sheetnames:
             raise ValueError(f"缺少工作表：「{SHEET_INFO}」或「{SHEET_INVOICES}」")

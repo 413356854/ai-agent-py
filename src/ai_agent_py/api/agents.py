@@ -16,7 +16,7 @@ import asyncio
 import contextlib
 import logging
 from functools import lru_cache
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import quote
 
 from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
@@ -629,7 +629,7 @@ def download_sample(agent_id: str, sample_id: str, fmt: str = "xlsx") -> Respons
 
 
 @router.post("/{agent_id}/upload", response_model=UploadResult, summary="上传单据并解析")
-async def upload_claim(agent_id: str, file: UploadFile = File(...)) -> UploadResult:
+async def upload_claim(agent_id: str, file: Annotated[UploadFile, File()]) -> UploadResult:
     _require(agent_id)
     content = await file.read()
     if not content:

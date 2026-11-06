@@ -451,11 +451,11 @@ def _localize_mermaid(text: str) -> str:
     """把 mermaid 里的节点标签换成中文（结构仍来自 LangGraph 导出）。"""
     for node_id, meta in NODE_META.items():
         label = meta["label"]
-        text = re.sub(
-            rf"(?<![\w]){re.escape(node_id)}\(([^)]*)\)",
-            lambda _m, node_id=node_id, label=label: f"{node_id}({label})",
-            text,
-        )
+
+        def _relabel(_match: re.Match[str], node_id: str = node_id, label: str = label) -> str:
+            return f"{node_id}({label})"
+
+        text = re.sub(rf"(?<![\w]){re.escape(node_id)}\(([^)]*)\)", _relabel, text)
     text = text.replace("__start__([<p>__start__</p>])", "__start__([<p>开始</p>])")
     text = text.replace("__end__([<p>__end__</p>])", "__end__([<p>结束</p>])")
 

@@ -8,13 +8,15 @@
 
 from __future__ import annotations
 
+import itertools
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import yaml
 
@@ -277,7 +279,7 @@ def check_consecutive_invoice(claim: dict, params: dict, ctx: dict) -> list[dict
     """R4.4 连号发票：发票号连续出现，疑似集中开票或拆分报销，提示人工。"""
     numbers = sorted(int(inv["number"]) for inv in _invoices(claim) if str(inv.get("number", "")).isdigit())
     runs: list[str] = []
-    for prev, cur in zip(numbers, numbers[1:]):
+    for prev, cur in itertools.pairwise(numbers):
         if cur - prev == 1:
             runs.extend([str(prev), str(cur)])
     if not runs:

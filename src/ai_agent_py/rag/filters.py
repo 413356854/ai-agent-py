@@ -8,7 +8,7 @@ Milvus 的 ``search`` / ``hybrid_search`` 原生支持 ``filter`` 表达式，�
 当前只开放文档级过滤（``doc_ids``）：``rag_chunk.doc_id`` 已有 INVERTED 索引，
 接上即可用，不需要改集合结构。法规元数据（``doc_type`` / ``status`` /
 ``effective_date``）要先给集合增列并回灌，属于元数据补齐；schema 落地后再往
-`SearchFilter` 加字段，并把表达式拼装收敛到本模块（见 docs/rag-agent-review.md R-01）。
+`SearchFilter` 加字段，并把表达式拼装收敛到本模块。
 """
 
 from __future__ import annotations

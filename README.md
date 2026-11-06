@@ -186,7 +186,7 @@ ai-agent-py/
 │       ├── oss.py            # 私域 OSS：上传 / 列举 / 换取直链 / 删除（access 鉴权）
 │       └── rag.py            # RAG 记录列表 + RAG 问答（含 SSE 流式）
 ├── web/                      # 管理后台（文档解析 / RAG 记录 / RAG 问答 / Agent 应用 / 通用 Agent / 私域 OSS）
-└── tests/                    # pytest：加载、切分、链路、图、API、CLI、MinerU、MySQL、RAG、通用 Agent、HITL
+└── tests/                    # pytest：文档解析、RAG 检索/问答、通用 Agent、HITL、报销审核（全部离线）
 ```
 
 ## 快速开始
@@ -714,7 +714,7 @@ Invoke-RestMethod http://127.0.0.1:8000/api/db/health
 | `db_ai_agent`（源库，23 张表） | `utf8mb4` | `utf8mb4_0900_ai_ci` |
 | 服务端默认 | `utf8mb4` | `utf8mb4_0900_ai_ci` |
 
-[`docs/db/create_database.sql`](docs/db/create_database.sql) 默认复刻 `db_py_agent`
+[`docs/mysql/create_database.sql`](docs/mysql/create_database.sql) 默认复刻 `db_py_agent`
 读取到的值（`utf8mb4` + `utf8mb4_general_ci`），可在 MySQL 客户端中直接执行；脚本只创建 / 对齐
 数据库本身，不建表、不写数据。文末另附一段取消注释即可使用的 `ALTER`，用于把默认排序规则
 改成与源库一致的 `utf8mb4_0900_ai_ci`。
@@ -1016,7 +1016,7 @@ graph = build_agent_graph(tools=tools)
 - 全局开关：`AGENT_TOOL_TIMEOUT` / `AGENT_TOOL_RETRIES` / `AGENT_TOOL_PARALLEL`。
   自定义工具不登记也会拿到默认策略；要单独收紧时构造
   `ToolPolicies(default=..., overrides={"my_tool": ToolPolicy(timeout=5)})` 传给 `build_tool_node`。
-- 尚未做：MCP（`langchain-mcp-adapters`）让工具从「写死清单」变成可配置服务器（见评审 A-09）。
+- 尚未做：MCP（`langchain-mcp-adapters`）让工具从「写死清单」变成可配置服务器。
 
 ### 3. RAG 问答图（`graph/rag_chat.py` + `rag/milvus_search.py` + `rag/doc_names.py`）
 
@@ -1188,7 +1188,7 @@ uv run ai-agent-py db import-jobs             # 写入 tb_document_parse_job
 ## 开发
 
 ```powershell
-uv run pytest            # 478 个测试，全部离线（MinerU / 精排用 httpx.MockTransport，任务记录库用内存 JobStore，RAG 记录 / 问答用假 Milvus 客户端与脚本化模型；检索链路用 offline.OfflineChunkSearcher）
+uv run pytest            # 199 个测试，全部离线（MinerU 用 httpx.MockTransport，任务记录用内存 JobStore，RAG 记录 / 问答用假 Milvus 客户端与脚本化模型；检索链路用 offline.OfflineChunkSearcher）
 uv run ruff check .      # 静态检查
 uv run ruff format .     # 格式化
 uv run mypy              # 类型检查（src 目录）
@@ -1208,10 +1208,10 @@ pnpm build               # 产物 web/dist，由 FastAPI 托管
   流式假模型（`StreamingScriptedChatModel`，覆盖 SSE 逐 token 推送），
   `offline.LexicalHashEmbeddings` 提供确定性向量，`tests/test_mineru.py` 里的 `FakeMineru`
   用 `httpx.MockTransport` 模拟 MinerU 全流程（上传 / 轮询 / 下载 zip）；
-  `tests/test_database.py` 用假引擎覆盖成功与密码错误两条路径，不会连本机 MySQL；
   `tests/test_rag_records.py` / `tests/test_milvus_search.py` / `tests/test_rag_chat_graph.py` /
-  `tests/test_rag_api.py` / `tests/test_doc_names.py` 用假 Milvus 客户端、假文件名存储与
-  脚本化模型覆盖 RAG 记录与问答，不连 Milvus / MySQL。
+  `tests/test_rag_api.py` 用假 Milvus 客户端与脚本化模型覆盖 RAG 记录与问答，不连 Milvus / MySQL。
+- 测试只覆盖各业务的主流程（解析 → 切分 → 入库 → 检索问答 → 审批 / 报销），
+  配置解析、CLI、工具函数等细粒度单测不再保留，改动这些内部实现时按需临时补测。
 
 ## 常见问题
 
